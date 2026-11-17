@@ -4,3 +4,7 @@ Options -Indexes
 <FilesMatch "^\.env">
     Require all denied
 </FilesMatch>
+
+# Defense in depth: these directories must never be web-readable.
+RedirectMatch 404 (?i)/(?:src|database|storage|deploy|docker|htaccess_backup)(?:/|$)
+RedirectMatch 404 (?i)/\.(?:git|env)(?:/|$)

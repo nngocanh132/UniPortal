@@ -11,7 +11,7 @@ require_once $root . '/src/src/services/PaymentService.php';
 require_once $root . '/src/src/config/payment.php';
 
 require_student();
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $pdo        = get_db();
 $student_id = $_SESSION['student_id'] ?? '';

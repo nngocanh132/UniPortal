@@ -18,7 +18,7 @@ require_once $root . '/src/src/models/TeachingSchedule.php';
 require_once $root . '/src/src/services/RegistrationService.php';
 
 require_student();
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $studentId = $_SESSION['student_id'] ?? '';
 $pdo       = get_db();

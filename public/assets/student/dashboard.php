@@ -22,7 +22,7 @@ $full_name       = $_SESSION['full_name']        ?? 'Sinh viên';
 // ── Handle logout ─────────────────────────────────────────────
 if (isset($_GET['logout'])) {
     auth_logout();
-    header('Location: /UniPortal/public/index.php');
+    header('Location: ' . app_url('index.php'));
     exit;
 }
 

@@ -492,7 +492,7 @@ class PaymentService {
                 $paidFull ? '✅ Đã xác nhận thanh toán học phí' : '💰 Đã nhận thanh toán một phần',
                 ($paidFull ? 'Đã nhận ' : 'Đã nhận ') . number_format($amount) . ' ₫' . ($paidFull ? '' : ', còn lại ' . number_format($outstanding - $amount) . ' ₫')
                 . ' • Mã GD ' . $txn['provider_transaction_id'] . (!empty($txn['is_test']) ? ' (TEST)' : ''),
-                '/UniPortal/public/assets/student/tuition.php');
+                app_url('assets/student/tuition.php'));
         }
         if ($overpaid > 0) {
             self::notifyAdmins('Khoản thu vượt cần xử lý: +' . number_format($overpaid) . ' ₫',
@@ -690,7 +690,7 @@ class PaymentService {
         try {
             NotificationService::broadcast('AcademicAffairs', 'Payment',
                 ($isTest ? '[TEST] ' : '') . $title, $body,
-                '/UniPortal/public/assets/admin/tuition.php?tab=unmatched');
+                app_url('assets/admin/tuition.php?tab=unmatched'));
         } catch (Throwable) {}
     }
 }

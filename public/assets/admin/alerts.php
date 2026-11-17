@@ -9,9 +9,9 @@ require_once $root . '/src/src/services/AcademicAlertService.php';
 require_once $root . '/src/src/services/NotificationService.php';
 
 require_login();
-if ($_SESSION['role'] === 'Student')  { header('Location: /UniPortal/public/assets/student/dashboard.php'); exit; }
-if ($_SESSION['role'] === 'Lecturer') { header('Location: /UniPortal/public/assets/lecturer/dashboard.php'); exit; }
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if ($_SESSION['role'] === 'Student')  { header('Location: ' . app_url('assets/student/dashboard.php')); exit; }
+if ($_SESSION['role'] === 'Lecturer') { header('Location: ' . app_url('assets/lecturer/dashboard.php')); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $pdo      = get_db();
 $adminId  = (int)($_SESSION['account_id'] ?? 25);
@@ -44,7 +44,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $accId = (int)($accRow->fetchColumn() ?? 0);
                 if ($accId) {
                     NotificationService::send($accId, 'Warning', "⚠️ Cảnh báo học vụ: " . $msg,
-                        $msg, '/UniPortal/public/assets/student/alerts.php');
+                        $msg, app_url('assets/student/alerts.php'));
                 }
                 AcademicAlertService::writeAuditLog($pdo, $adminId, 'CREATE_WARNING', 'AcademicWarning', $sid,
                     null, json_encode(['type' => $type, 'msg' => $msg]));

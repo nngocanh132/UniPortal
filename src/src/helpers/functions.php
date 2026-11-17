@@ -4,6 +4,8 @@
  * Loaded by every page via auth.php (which already calls require_once database.php).
  */
 
+require_once __DIR__ . '/../config/app.php';
+
 // ── Output escaping ───────────────────────────────────────────
 if (!function_exists('h')) {
     function h(mixed $v): string {

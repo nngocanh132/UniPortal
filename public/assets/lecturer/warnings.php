@@ -16,7 +16,7 @@ require_once $root . '/src/src/models/Lecturer.php';
 require_once $root . '/src/src/services/WarningInterventionService.php';
 
 require_lecturer();
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $lecId     = (int)($_SESSION['lecturer_id'] ?? 0);
 $accountId = (int)($_SESSION['account_id'] ?? 0);

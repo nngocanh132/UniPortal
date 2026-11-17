@@ -283,7 +283,7 @@ class TeachingSchedule {
                 'Không đủ ngày để xếp lịch giảng dạy',
                 ($section['course_code'] ?? '') . ' – ' . ($section['section_code'] ?? '') . ': ' .
                     $message,
-                '/UniPortal/public/assets/admin/schedule.php'
+                app_url('assets/admin/schedule.php')
             );
 
             return ['ok' => false, 'message' => $message];
@@ -626,7 +626,7 @@ class TeachingSchedule {
             'Đề xuất nghỉ buổi học',
             $session['course_code'] . ' – ' . $session['section_code'] . ' • ' .
                 date('d/m/Y', strtotime($session['session_date'])) . '. Lý do: ' . $reason,
-            '/UniPortal/public/assets/admin/schedule_requests.php'
+            app_url('assets/admin/schedule_requests.php')
         );
 
         return ['ok' => true, 'message' => 'Đã gửi đề xuất nghỉ buổi học. Lịch học chính thức chưa thay đổi cho đến khi Admin duyệt.'];
@@ -716,7 +716,7 @@ class TeachingSchedule {
             $session['course_code'] . ' – ' . $session['section_code'] . ' • ' .
                 date('d/m/Y', strtotime($date)) . ' ' . substr($start, 0, 5) . '–' . substr($end, 0, 5) .
                 '. Lý do: ' . $reason,
-            '/UniPortal/public/assets/admin/schedule_requests.php'
+            app_url('assets/admin/schedule_requests.php')
         );
 
         return ['ok' => true, 'message' => 'Đã gửi đề xuất học bù. Buổi học bù chỉ được xếp lịch sau khi Admin duyệt.'];
@@ -1113,7 +1113,7 @@ class TeachingSchedule {
                     $lecAccountId, 'Schedule', 'Đề xuất ' . $typeLabel . ' bị từ chối',
                     $req['course_code'] . ' – ' . $req['section_code'] . ' • Buổi ' . $origDate .
                         '. Lý do từ chối: ' . $note,
-                    '/UniPortal/public/assets/lecturer/schedule.php'
+                    app_url('assets/lecturer/schedule.php')
                 );
             }
             return;
@@ -1124,7 +1124,7 @@ class TeachingSchedule {
                 ' đã được hủy theo đề xuất của giảng viên.' . ($note !== '' ? ' Ghi chú: ' . $note : '');
             if ($lecAccountId) {
                 NotificationService::send($lecAccountId, 'Schedule', 'Buổi học đã được hủy',
-                    $body, '/UniPortal/public/assets/lecturer/schedule.php');
+                    $body, app_url('assets/lecturer/schedule.php'));
             }
             self::notifySectionStudents(
                 (int)$req['section_id'], 'Lịch học thay đổi: buổi học bị hủy', $body
@@ -1141,7 +1141,7 @@ class TeachingSchedule {
             ' ' . $time . ($req['proposed_room'] ? ' tại ' . $req['proposed_room'] : '') . '.';
         if ($lecAccountId) {
             NotificationService::send($lecAccountId, 'Schedule', 'Buổi học bù đã được duyệt',
-                $body, '/UniPortal/public/assets/lecturer/schedule.php');
+                $body, app_url('assets/lecturer/schedule.php'));
         }
         self::notifySectionStudents(
             (int)$req['section_id'], 'Lịch học thay đổi: buổi học bù mới', $body
@@ -1160,7 +1160,7 @@ class TeachingSchedule {
         $stmt->execute([':sec' => $sectionId]);
         foreach ($stmt->fetchAll() as $row) {
             NotificationService::send((int)$row['account_id'], 'Schedule', $title, $body,
-                '/UniPortal/public/assets/student/schedule.php');
+                app_url('assets/student/schedule.php'));
         }
     }
 }

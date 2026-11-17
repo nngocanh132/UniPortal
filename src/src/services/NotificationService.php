@@ -170,7 +170,7 @@ class NotificationService {
         );
         $recipients->execute([':sid' => $section_id]);
 
-        $link   = '/UniPortal/public/assets/student/assignment_detail.php?id=' . $assignment_id;
+        $link   = app_url('assets/student/assignment_detail.php?id=') . $assignment_id;
         $nTitle = mb_strimwidth('Bài tập mới: ' . $title, 0, 197, '…');
         $nBody  = 'Môn ' . $info['course_name'] . ' (' . $info['course_code'] . ')'
                 . ' · GV ' . $info['lecturer_name']
@@ -230,7 +230,7 @@ class NotificationService {
             'Grade',
             $is_update ? 'Điểm bài tập đã được cập nhật' : 'Bài tập đã được chấm điểm',
             $body,
-            '/UniPortal/public/assets/student/assignment_detail.php?id=' . (int)$row['assignment_id']
+            app_url('assets/student/assignment_detail.php?id=') . (int)$row['assignment_id']
         );
     }
 

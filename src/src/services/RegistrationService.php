@@ -1118,7 +1118,7 @@ class RegistrationService {
                 $accountId, 'Registration',
                 '✅ Đăng ký thành công: ' . $section['course_code'],
                 'Bạn đã đăng ký lớp ' . $section['section_code'] . ' – ' . $section['course_name'],
-                '/UniPortal/public/assets/student/registration.php'
+                app_url('assets/student/registration.php')
             );
 
             if ($confirmedNow) {
@@ -1208,7 +1208,7 @@ class RegistrationService {
                 $accountId, 'Registration',
                 'Đã hủy đăng ký: ' . $section['section_code'],
                 'Bạn đã hủy đăng ký lớp ' . $section['section_code'] . '. Trạng thái mở lớp (nếu đã xác nhận) được giữ nguyên.',
-                '/UniPortal/public/assets/student/registration.php'
+                app_url('assets/student/registration.php')
             );
 
             return ['ok' => true, 'message' => 'Đã hủy đăng ký lớp ' . $section['section_code'] . '.'];
@@ -1377,7 +1377,7 @@ class RegistrationService {
             $q->execute([':sid' => $sectionId]);
             foreach ($q->fetchAll() as $row) {
                 NotificationService::send((int)$row['account_id'], 'Registration', $title, $body,
-                    $link !== '' ? $link : '/UniPortal/public/assets/student/registration.php');
+                    $link !== '' ? $link : app_url('assets/student/registration.php'));
             }
         } catch (Throwable) {}
     }

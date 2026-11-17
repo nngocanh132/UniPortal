@@ -1,3 +1,0 @@
-BAI NOP DEMO - Nguyen Minh Anh (23070001)
-
-Bao cao quy trinh hoc vu: dang ky mon, diem danh, nop bai, cham diem.

@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+storage/uploads
+storage/logs
+storage/sessions
+deploy/db
+deploy/*.tar.gz
+deploy/*.local.env
+node_modules
+*.sql
+*.sql.gz
+.DS_Store
+Thumbs.db

@@ -9,11 +9,18 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/functions.php';
 
 // ── Session bootstrap ─────────────────────────────────────────
+function auth_is_https(): bool {
+    $proto = strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''));
+    if ($proto !== '') return $proto === 'https';
+    $https = $_SERVER['HTTPS'] ?? '';
+    return $https !== '' && strtolower((string)$https) !== 'off';
+}
+
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
         'lifetime' => 0,
         'path'     => '/',
-        'secure'   => false,
+        'secure'   => env_bool('SESSION_SECURE_COOKIE', auth_is_https()),
         'httponly' => true,
         'samesite' => 'Strict',
     ]);
@@ -105,6 +112,7 @@ function auth_login(string $username, string $password, bool $remember = false):
         setcookie('remember_token', $token, [
             'expires'  => time() + 60 * 60 * 24 * 30,
             'path'     => '/',
+            'secure'   => env_bool('SESSION_SECURE_COOKIE', auth_is_https()),
             'httponly' => true,
             'samesite' => 'Strict',
         ]);
@@ -134,9 +142,9 @@ function require_csrf_on_post(): void {
 }
 
 // ── Guards ────────────────────────────────────────────────────
-function require_login(string $redirect = '/UniPortal/public/index.php'): void {
+function require_login(?string $redirect = null): void {
     if (empty($_SESSION['account_id'])) {
-        header('Location: ' . $redirect);
+        header('Location: ' . app_link($redirect ?? app_url('index.php')));
         exit;
     }
 }
@@ -144,7 +152,7 @@ function require_login(string $redirect = '/UniPortal/public/index.php'): void {
 function require_student(): void {
     require_login();
     if (($_SESSION['role'] ?? '') !== 'Student') {
-        header('Location: /UniPortal/public/index.php');
+        header('Location: ' . app_url('index.php'));
         exit;
     }
 }
@@ -152,7 +160,7 @@ function require_student(): void {
 function require_lecturer(): void {
     require_login();
     if (($_SESSION['role'] ?? '') !== 'Lecturer') {
-        header('Location: /UniPortal/public/index.php');
+        header('Location: ' . app_url('index.php'));
         exit;
     }
 }
@@ -160,7 +168,7 @@ function require_lecturer(): void {
 function require_staff(): void {
     require_login();
     if (!in_array($_SESSION['role'] ?? '', ['Lecturer', 'AcademicAffairs'])) {
-        header('Location: /UniPortal/public/index.php');
+        header('Location: ' . app_url('index.php'));
         exit;
     }
 }

@@ -1,6 +1,17 @@
 node_modules
 .env
+.env.*
+!.env.example
 dist
 build
 .DS_Store
 Thumbs.db
+
+# Runtime data – never committed
+storage/logs/
+storage/uploads/
+deploy/db/
+deploy/uploads-*.tar.gz
+deploy/*.local.env
+*.sql
+*.sql.gz

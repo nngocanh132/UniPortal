@@ -1,7 +1,3 @@
-# Prevent direct HTTP access to uploaded files.
-# All file downloads must go through /UniPortal/public/download.php
+# Uploaded files are private. All downloads go through public/download.php.
 Options -Indexes
-<FilesMatch ".*">
-    Order allow,deny
-    Deny from all
-</FilesMatch>
+Require all denied

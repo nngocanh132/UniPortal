@@ -20,10 +20,10 @@ require_once $root . '/src/src/services/SystemConfig.php';
 require_once $root . '/src/src/services/GpaAiService.php';
 
 require_student();
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $sid = (string)($_SESSION['student_id'] ?? '');
-if ($sid === '') { header('Location: /UniPortal/public/index.php'); exit; }
+if ($sid === '') { header('Location: ' . app_url('index.php')); exit; }
 
 function gf(?float $v): string { return $v !== null ? number_format($v, 2) : '—'; }
 

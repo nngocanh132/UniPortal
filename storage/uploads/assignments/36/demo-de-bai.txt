@@ -1,4 +1,0 @@
-DE BAI DEMO - Bai tap chuyen can tuan 10
-
-Yeu cau: Viet bao cao ngan ve quy trinh hoc vu cua UniPortal.
-Dinh dang: PDF hoac TXT. Han nop: 7 ngay ke tu khi cong bo.

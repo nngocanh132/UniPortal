@@ -105,7 +105,7 @@ class AssignmentService {
         }
         NotificationService::send($accountId, 'Assignment', 'Nộp bài thành công',
             $assignment['title'] . ' – phiên bản ' . $version,
-            '/UniPortal/public/assets/student/assignment_detail.php?id=' . $assignmentId);
+            app_url('assets/student/assignment_detail.php?id=') . $assignmentId);
         return ['ok' => true, 'message' => 'Nộp bài thành công! Phiên bản ' . $version . ' – ' . count($saved) . ' file.',
             'submission_id' => $submissionId, 'version' => $version];
     }

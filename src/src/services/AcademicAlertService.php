@@ -563,7 +563,7 @@ class AcademicAlertService {
             if ($accId) {
                 NotificationService::send($accId, 'Warning',
                     '⚠️ ' . $title, $body,
-                    '/UniPortal/public/assets/student/alerts.php');
+                    app_url('assets/student/alerts.php'));
             }
         } catch (Throwable) {}
     }

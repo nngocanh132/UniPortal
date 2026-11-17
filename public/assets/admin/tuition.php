@@ -11,10 +11,10 @@ require_once $root . '/src/src/config/payment.php';
 
 require_login();
 if (($_SESSION['role'] ?? '') !== 'AcademicAffairs') {
-    header('Location: /UniPortal/public/index.php');
+    header('Location: ' . app_url('index.php'));
     exit;
 }
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $pdo      = get_db();
 $adminId  = (int)($_SESSION['account_id'] ?? 0);
@@ -540,7 +540,7 @@ document.querySelectorAll('.js-resolve').forEach(function (btn) {
         <tbody>
             <tr><td style="width:220px;color:#64748b;">Nhà cung cấp</td><td><strong><?= h($cfg['provider']) ?></strong> (<?= h($cfg['gateway']) ?>)</td></tr>
             <tr><td style="color:#64748b;">Ngân hàng nhận tiền</td><td><?= h($cfg['bank_code']) ?> • BIN <?= h($cfg['bank_bin']) ?> • <?= h($cfg['account_number']) ?> • <?= h($cfg['account_holder']) ?></td></tr>
-            <tr><td style="color:#64748b;">Webhook endpoint</td><td><code>/UniPortal/public/payment_webhook.php</code></td></tr>
+            <tr><td style="color:#64748b;">Webhook endpoint</td><td><code><?= h(app_absolute_url('api/payment_webhook.php')) ?></code></td></tr>
             <tr><td style="color:#64748b;">Live credentials</td>
                 <td><?= $cfg['api_key'] !== '' ? '✅ SEPAY_API_KEY đã nạp' : '❌ Thiếu SEPAY_API_KEY'; ?>
                     • <?= $cfg['webhook_secret'] !== '' ? '✅ SEPAY_WEBHOOK_SECRET đã nạp' : '❌ Thiếu SEPAY_WEBHOOK_SECRET'; ?></td></tr>

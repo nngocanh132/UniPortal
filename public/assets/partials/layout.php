@@ -48,9 +48,13 @@ if (isset($_GET['read_notif']) && !empty($_SESSION['account_id'])) {
     $note      = $notifId === false ? false : NotificationService::getForAccount($notifId, $accountId);
     if ($note) {
         NotificationService::markRead($notifId, $accountId);
-        $target = (string)$note['link'];
+        $target = app_link((string)$note['link']);
         // Only same-site links are followed; anything else falls back to the current page.
-        if (preg_match('~\A/UniPortal/[A-Za-z0-9._/?=&%#-]*\z~', $target) === 1) {
+        $parts = parse_url($target);
+        $isLocal = is_array($parts)
+            && empty($parts['scheme']) && empty($parts['host'])
+            && $target !== '' && $target[0] === '/' && !str_starts_with($target, '//');
+        if ($isLocal) {
             header('Location: ' . $target, true, 303);
             exit;
         }

@@ -7,8 +7,8 @@ $root = dirname(__DIR__, 3);
 require_once $root . '/src/src/helpers/auth.php';
 
 require_login();
-if ($_SESSION['role'] !== 'AcademicAffairs') { header('Location: /UniPortal/public/index.php'); exit; }
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if ($_SESSION['role'] !== 'AcademicAffairs') { header('Location: ' . app_url('index.php')); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $pdo = get_db();
 

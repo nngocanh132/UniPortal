@@ -10,8 +10,8 @@ require_once $root . '/src/src/services/AcademicAlertService.php';
 require_once $root . '/src/src/services/RegistrationService.php';
 
 require_login();
-if ($_SESSION['role'] !== 'AcademicAffairs') { header('Location: /UniPortal/public/index.php'); exit; }
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if ($_SESSION['role'] !== 'AcademicAffairs') { header('Location: ' . app_url('index.php')); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $pdo       = get_db();
 $adminAccId= (int)($_SESSION['account_id'] ?? 25);
@@ -52,7 +52,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         return ($row['semester_name']??'').' '.($row['academic_year']??'');
                     })(),
                     'Đăng ký môn học đã mở. Vào Cổng sinh viên để đăng ký.',
-                    '/UniPortal/public/assets/student/registration.php'
+                    app_url('assets/student/registration.php')
                 );
             }
             AcademicAlertService::writeAuditLog($pdo,$adminAccId,'UPDATE_SEMESTER','Semester',(string)$semId,null,json_encode(['status'=>$status]));

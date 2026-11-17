@@ -10,8 +10,8 @@ require_once $root . '/src/src/services/AcademicAlertService.php';
 require_once $root . '/src/src/services/RegistrationService.php';
 
 require_login();
-if ($_SESSION['role'] !== 'AcademicAffairs') { header('Location: /UniPortal/public/index.php'); exit; }
-if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
+if ($_SESSION['role'] !== 'AcademicAffairs') { header('Location: ' . app_url('index.php')); exit; }
+if (isset($_GET['logout'])) { auth_logout(); header('Location: ' . app_url('index.php')); exit; }
 
 $pdo = get_db();
 $adminAccId = (int)($_SESSION['account_id'] ?? 0);

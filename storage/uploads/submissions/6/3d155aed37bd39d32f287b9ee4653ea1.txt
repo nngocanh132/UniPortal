@@ -1,5 +1,0 @@
-[DEMO UI] ERD notes
-Customer(customer_id, name)
-Order(order_id, customer_id)
-Product(product_id, name, price)
-OrderItem(order_id, product_id, quantity)
