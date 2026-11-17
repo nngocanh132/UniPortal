@@ -1,2 +1,6 @@
 DirectoryIndex index.php
 Options -Indexes
+
+<FilesMatch "^\.env">
+    Require all denied
+</FilesMatch>

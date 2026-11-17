@@ -24,6 +24,9 @@ class GpaAdvisor {
     public const POLICY_REPLACE   = 'replace';
     public const POLICY_BEST      = 'best';
 
+    // Lowest passing grade point on the 4-point scale (D); F is 0.
+    private const PASS_GRADE_POINT = 1.0;
+
     // ─────────────────────────────────────────────────────────
     // Configuration
     // ─────────────────────────────────────────────────────────
@@ -228,11 +231,13 @@ class GpaAdvisor {
         $required   = self::requiredCredits();
         $passGpa    = self::passGpa();
 
-        // Graduation credits count each course once, regardless of GPA policy.
+        // Graduation credits come straight from the transcript: every completed,
+        // passed enrollment counts once. Grouping by course code here collapsed
+        // retaken courses and under-reported credits already earned.
         $graduationEarned = 0;
-        foreach ($groups as $g) {
-            if ($g['best_gpa'] >= $passGpa) {
-                $graduationEarned += (int)$g['credits'];
+        foreach ($attempts as $a) {
+            if ((float)$a['grade_point'] >= self::PASS_GRADE_POINT) {
+                $graduationEarned += (int)$a['credits'];
             }
         }
         $remaining = max(0, $required - $graduationEarned);

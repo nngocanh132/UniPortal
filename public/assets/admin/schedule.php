@@ -45,9 +45,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $sch->execute([':id' => $sid]);
         $schedule = $sch->fetch();
         if ($schedule) {
-            $r = TeachingSchedule::syncSessions($schedule);
-            $_SESSION['admin_schedule_flash'] = 'success:Đã đồng bộ: tạo mới ' . $r['inserted'] .
-                ' buổi, cập nhật ' . $r['updated'] . ', gỡ ' . $r['removed'] . ' buổi chưa diễn ra.';
+            try {
+                $r = TeachingSchedule::syncSessions($schedule);
+                $_SESSION['admin_schedule_flash'] = 'success:Đã đồng bộ: tạo mới ' . $r['inserted'] .
+                    ' buổi, cập nhật ' . $r['updated'] . ', gỡ ' . $r['removed'] .
+                    ' buổi chưa diễn ra. Tổng số buổi chính thức: ' . $r['total'] . '/' . $r['expected'] . '.';
+            } catch (Throwable $e) {
+                $_SESSION['admin_schedule_flash'] = 'error:' . $e->getMessage();
+            }
         } else {
             $_SESSION['admin_schedule_flash'] = 'error:Không tìm thấy lịch cần đồng bộ.';
         }
@@ -227,7 +232,7 @@ function ts_time(string $t): string { return substr($t, 0, 5); }
             </div>
             <div>
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Phòng học</label>
-                <input type="text" name="room" id="sfRoom" maxlength="30" placeholder="VD: B1.401" style="width:100%;height:36px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;" />
+                <input type="text" name="room" id="sfRoom" maxlength="30" required placeholder="VD: B1.401" style="width:100%;height:36px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;" />
             </div>
             <div>
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Ngày bắt đầu áp dụng *</label>
@@ -236,6 +241,13 @@ function ts_time(string $t): string { return substr($t, 0, 5); }
             <div>
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Ngày kết thúc áp dụng *</label>
                 <input type="date" name="effective_end" id="sfEndDate" value="<?= h($semInfo['end_date'] ?? '') ?>" required style="width:100%;height:36px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;" />
+            </div>
+            <div>
+                <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Số buổi dự kiến *</label>
+                <input type="number" name="expected_sessions" id="sfExpected" min="1" max="60" required
+                       title="Mặc định = số tín chỉ × 5 (2 tín chỉ = 10 buổi, 3 tín chỉ = 15 buổi)"
+                       style="width:100%;height:36px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;" />
+                <div id="sfExpectedHint" style="font-size:11px;color:#94a3b8;margin-top:3px;">Mặc định: tín chỉ × 5</div>
             </div>
             <div style="display:flex;align-items:flex-end;gap:8px;">
                 <button type="submit" class="abtn abtn--primary" style="background:#0d1b2e;">💾 Lưu lịch &amp; sinh buổi học</button>
@@ -263,7 +275,7 @@ function ts_time(string $t): string { return substr($t, 0, 5); }
                     <th>THỜI GIAN</th>
                     <th>PHÒNG</th>
                     <th>ÁP DỤNG</th>
-                    <th style="text-align:center;">BUỔI</th>
+                    <th style="text-align:center;">BUỔI (TẠO / DỰ KIẾN)</th>
                     <th>THAO TÁC</th>
                 </tr>
             </thead>
@@ -285,9 +297,19 @@ function ts_time(string $t): string { return substr($t, 0, 5); }
                     <td style="font-size:11px;color:#64748b;white-space:nowrap;">
                         <?= date('d/m/Y', strtotime($sc['effective_start'])) ?><br/>→ <?= date('d/m/Y', strtotime($sc['effective_end'])) ?>
                     </td>
+                    <?php
+                    $expCount = (int)($sc['expected_sessions'] ?? 0);
+                    if ($expCount < 1) $expCount = TeachingSchedule::expectedSessionsForCredits((int)$sc['credits']);
+                    $genCount = (int)($sc['generated_count'] ?? 0);
+                    ?>
                     <td style="text-align:center;">
-                        <div style="font-weight:800;color:#0d1b2e;"><?= (int)$sc['session_count'] ?></div>
+                        <div style="font-weight:800;color:<?= $genCount === $expCount ? '#0d1b2e' : '#b45309' ?>;">
+                            <?= $genCount ?> / <?= $expCount ?>
+                        </div>
                         <div style="font-size:10px;color:#64748b;"><?= (int)$sc['upcoming_count'] ?> sắp tới</div>
+                        <?php if ($genCount !== $expCount): ?>
+                        <div style="font-size:10px;color:#b45309;font-weight:600;">⚠ Cần đồng bộ</div>
+                        <?php endif; ?>
                     </td>
                     <td>
                         <div style="display:flex;gap:4px;flex-wrap:wrap;">
@@ -324,6 +346,10 @@ window.SEM_INFO = <?= json_encode($semInfo, JSON_UNESCAPED_UNICODE | JSON_HEX_TA
     var roomInput = document.getElementById('sfRoom');
     var startDate = document.getElementById('sfStartDate');
     var endDate = document.getElementById('sfEndDate');
+    var expInput = document.getElementById('sfExpected');
+    var expHint = document.getElementById('sfExpectedHint');
+
+    expInput.addEventListener('input', function(){ this.dataset.auto = '0'; });
 
     function byId(id){ return sections.filter(function(s){ return String(s.section_id) === String(id); })[0]; }
 
@@ -345,20 +371,26 @@ window.SEM_INFO = <?= json_encode($semInfo, JSON_UNESCAPED_UNICODE | JSON_HEX_TA
     function updateInfo(){
         var s = byId(secSel.value);
         if (!s) { info.textContent = ''; return; }
-        info.innerHTML = '📚 ' + s.course_code + ' – ' + s.course_name +
-            ' &nbsp;•&nbsp; 👥 ' + s.enrolled_count + ' sinh viên' +
-            ' &nbsp;•&nbsp; 🏫 ' + (s.room || 'chưa có phòng') +
-            ' &nbsp;•&nbsp; 📅 Học kỳ ' + s.start_date + ' → ' + s.end_date;
+        info.textContent = s.course_code + ' – ' + s.course_name +
+            ' • ' + s.enrolled_count + ' sinh viên • ' + (s.room || 'chưa có phòng') +
+            ' • Học kỳ ' + s.start_date + ' → ' + s.end_date;
         if (lecSel.value === '' || !secSel.dataset.loaded) {
             lecSel.value = s.lecturer_id;
         }
         if (!roomInput.value) roomInput.value = s.room || '';
         if (!startDate.value) startDate.value = s.start_date;
         if (!endDate.value) endDate.value = s.end_date;
+
+        var creditDefault = Math.max(1, (parseInt(s.credits, 10) || 0) * 5);
+        if (expInput.dataset.auto !== '0' || !expInput.value) {
+            expInput.value = creditDefault;
+        }
+        expHint.textContent = 'Tín chỉ: ' + (s.credits || '?') + ' → mặc định ' + creditDefault +
+            ' buổi (2 tín chỉ = 10, 3 tín chỉ = 15). Có thể điều chỉnh khi cần.';
     }
 
-    courseSel.addEventListener('change', function(){ secSel.dataset.loaded=''; fillSections(''); });
-    secSel.addEventListener('change', function(){ secSel.dataset.loaded='1'; updateInfo(); });
+    courseSel.addEventListener('change', function(){ expInput.dataset.auto='1'; secSel.dataset.loaded=''; fillSections(''); });
+    secSel.addEventListener('change', function(){ expInput.dataset.auto='1'; secSel.dataset.loaded=''; roomInput.value=''; updateInfo(); });
 
     fillSections('');
 
@@ -374,7 +406,9 @@ window.SEM_INFO = <?= json_encode($semInfo, JSON_UNESCAPED_UNICODE | JSON_HEX_TA
         roomInput.value = s.room || '';
         startDate.value = s.effective_start;
         endDate.value = s.effective_end;
+        expInput.dataset.auto = '0';
         updateInfo();
+        expInput.value = s.expected_sessions || Math.max(1, (parseInt(s.credits, 10) || 0) * 5);
         document.getElementById('scheduleForm').scrollIntoView({behavior:'smooth', block:'center'});
     };
 
@@ -383,12 +417,30 @@ window.SEM_INFO = <?= json_encode($semInfo, JSON_UNESCAPED_UNICODE | JSON_HEX_TA
         secSel.innerHTML = '<option value="">— Chọn lớp —</option>';
         secSel.dataset.loaded = '';
         info.textContent = '';
+        expInput.dataset.auto = '1';
+        expInput.value = '';
+        expHint.textContent = 'Mặc định: tín chỉ × 5';
         if (window.SEM_INFO) {
             startDate.value = window.SEM_INFO.start_date || '';
             endDate.value = window.SEM_INFO.end_date || '';
         }
         fillSections('');
     };
+    var selected = byId(<?= (int)($_GET['section'] ?? 0) ?>);
+    if (selected) {
+        courseSel.value = selected.course_id;
+        fillSections(selected.section_id);
+        if (selected.schedule_id) {
+            editSchedule(Object.assign({}, selected, {
+                start_time: selected.schedule_start, end_time: selected.schedule_end,
+                room: selected.schedule_room
+            }));
+        } else {
+            document.getElementById('sfDay').value = (selected.study_days || '1').split(',')[0];
+            if (selected.start_time) document.getElementById('sfStart').value = selected.start_time.substring(0,5);
+            if (selected.end_time) document.getElementById('sfEnd').value = selected.end_time.substring(0,5);
+        }
+    }
 })();
 </script>
 

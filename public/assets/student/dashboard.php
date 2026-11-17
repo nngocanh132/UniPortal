@@ -58,9 +58,10 @@ $chartCumGpa       = [];
 $runningCredits    = 0;
 $runningPoints     = 0;
 foreach ($gpaHistory as $row) {
-    // Short label e.g. "HK1 (23-24)"
+    // Short label e.g. "HK1 23-24"
     $yr    = $row['academic_year'] ?? '';
-    $short = preg_replace('/^Học kỳ\s*/i', 'HK', $row['semester_name'] ?? '') . ' (' . $yr . ')';
+    $yrLbl = preg_match('/^\d{4}-\d{4}$/', $yr) ? substr($yr, 2, 2) . '-' . substr($yr, -2) : $yr;
+    $short = preg_replace('/^Học kỳ\s*/i', 'HK', $row['semester_name'] ?? '') . ' ' . $yrLbl;
     $chartLabels[]  = $short;
     $chartSemGpa[]  = (float)($row['semester_gpa'] ?? 0);
     $runningCredits += (int)($row['credits_this_sem'] ?? 0);
@@ -80,153 +81,15 @@ function gpa_fmt(mixed $v): string { return $v !== null ? number_format((float)$
 
 // Asset base path (relative from this file's location → ../../assets/)
 $IMG = '../../assets/img/';
+
+// Reuse the shared student shell so the dashboard stays in sync with every other page
+$pageTitle  = 'Tổng quan';
+$activePage = 'dashboard';
+$imgBase    = $IMG;
+$assetBase  = '../../assets/';
+$warningCnt = $warningCount;
+require __DIR__ . '/../partials/layout.php';
 ?>
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tổng quan – UniPortal</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="stylesheet" href="../../assets/css/dashboard.css" />
-    <link rel="stylesheet" href="../../assets/css/system.css" />
-</head>
-<body>
-<div class="db-layout">
-
-<!-- ═══════════════════════════════════════════════════════════
-     SIDEBAR
-     ═══════════════════════════════════════════════════════════ -->
-<aside class="db-sidebar" id="sidebar" aria-label="Navigation">
-
-    <!-- Logo -->
-    <div>
-        <div class="db-sidebar__logo">
-            <img src="<?= $IMG ?>db-logo-vnuis-sidebar.png" alt="VNU-IS" />
-        </div>
-
-        <!-- Nav links -->
-        <nav class="db-sidebar__nav" aria-label="Student menu">
-            <a href="dashboard.php" class="active" aria-current="page">
-                <img src="<?= $IMG ?>db-nav-dashboard.svg" alt="" />
-                Tổng quan
-            </a>
-            <a href="gpa.php">
-                <img src="<?= $IMG ?>db-nav-grades.svg" alt="" />
-                Kết quả học tập
-            </a>
-            <a href="attendance.php">
-                <img src="<?= $IMG ?>db-nav-attendance.svg" alt="" />
-                Điểm danh - Chuyên cần
-            </a>
-            <a href="registration.php">
-                <img src="<?= $IMG ?>db-nav-grades.svg" alt="" />
-                Đăng ký môn học
-            </a>
-            <a href="assignments.php">
-                <img src="<?= $IMG ?>db-nav-attendance.svg" alt="" />
-                Bài tập &amp; Nộp bài
-            </a>
-            <a href="tuition.php">
-                <img src="<?= $IMG ?>db-icon-credits.svg" alt="" />
-                Học phí &amp; Thanh toán
-            </a>
-            <a href="gpa_forecast.php">
-                <img src="<?= $IMG ?>db-nav-gpa-plan.svg" alt="" />
-                Kế hoạch &amp; Dự báo GPA (AI)
-            </a>
-            <a href="alerts.php">
-                <img src="<?= $IMG ?>db-nav-alerts.svg" alt="" />
-                Cảnh báo học tập
-            </a>
-            <a href="schedule.php">
-                <img src="<?= $IMG ?>db-nav-schedule.svg" alt="" />
-                Thời khóa biểu
-            </a>
-            <a href="profile.php">
-                <img src="<?= $IMG ?>db-nav-profile.svg" alt="" />
-                Hồ sơ cá nhân
-            </a>
-        </nav>
-    </div>
-
-    <!-- Bottom profile + logout -->
-    <div class="db-sidebar__footer">
-        <div class="db-sidebar__profile-card">
-            <div class="profile-info">
-                <img class="avatar"
-                     src="<?= $IMG ?>db-profile.png"
-                     alt="<?= h($full_name) ?>" />
-                <div>
-                    <div class="name"><?= h($full_name) ?></div>
-                    <div class="student-id">MSSV: <?= h($student_id) ?></div>
-                </div>
-            </div>
-            <a href="dashboard.php?logout=1"
-               class="logout-btn"
-               title="Đăng xuất"
-               aria-label="Đăng xuất">
-                <img src="<?= $IMG ?>db-icon-logout.svg" alt="Đăng xuất" />
-            </a>
-        </div>
-    </div>
-
-</aside>
-
-<!-- ═══════════════════════════════════════════════════════════
-     HEADER
-     ═══════════════════════════════════════════════════════════ -->
-<header class="db-header" role="banner">
-    <div style="display:flex;align-items:center;gap:12px;">
-        <!-- Hamburger (mobile) -->
-        <button class="db-hamburger" id="hamburger" aria-label="Mở menu" aria-expanded="false">
-            <span></span><span></span><span></span>
-        </button>
-        <!-- Search -->
-        <div class="db-header__search">
-            <img class="search-icon"
-                 src="<?= $IMG ?>icon-search.svg"
-                 alt="" aria-hidden="true" />
-            <input type="search"
-                   placeholder="Tìm kiếm môn học, thông báo..."
-                   aria-label="Tìm kiếm" />
-        </div>
-    </div>
-
-    <div class="db-header__right">
-        <!-- Bell with warning count badge -->
-        <button class="db-header__bell"
-                aria-label="Thông báo<?= $warningCount > 0 ? ' (' . $warningCount . ' chưa đọc)' : '' ?>">
-            <img src="<?= $IMG ?>db-icon-bell.svg" alt="" />
-            <?php if ($warningCount > 0): ?>
-            <span class="badge" aria-hidden="true">
-                <?= min($warningCount, 9) ?><?= $warningCount > 9 ? '+' : '' ?>
-            </span>
-            <?php endif; ?>
-        </button>
-
-        <!-- Profile dropdown trigger -->
-        <button class="db-header__profile" id="profileToggle" aria-haspopup="true" aria-expanded="false">
-            <img class="avatar"
-                 src="<?= $IMG ?>db-profile.png"
-                 alt="<?= h($full_name) ?>" />
-            <div>
-                <div class="name"><?= h($full_name) ?></div>
-                <div class="student-id">MSSV: <?= h($student_id) ?></div>
-            </div>
-            <img class="caret"
-                 src="<?= $IMG ?>db-icon-caret.svg"
-                 alt="" aria-hidden="true" />
-        </button>
-    </div>
-</header>
-
-<!-- ═══════════════════════════════════════════════════════════
-     MAIN CONTENT
-     ═══════════════════════════════════════════════════════════ -->
-<main class="db-main" id="main-content">
-<div class="db-content">
 
     <!-- ═══════════════════════════════
          A. ACADEMIC KPI CARDS
@@ -263,7 +126,7 @@ $IMG = '../../assets/img/';
         <div class="card kpi-card">
             <div class="kpi-card__header">
                 <span class="kpi-card__label">GPA Kỳ hiện tại</span>
-                <span class="kpi-card__badge kpi-card__badge--green">
+                <span class="kpi-card__badge <?= $semesterGpa !== null ? 'kpi-card__badge--green' : 'kpi-card__badge--muted' ?>">
                     <?= $semesterGpa !== null ? GpaModel::getClassification($semesterGpa) : '—' ?>
                 </span>
             </div>
@@ -302,10 +165,6 @@ $IMG = '../../assets/img/';
                     <div class="progress-bar__fill progress-bar__fill--navy"
                          style="width:<?= $creditPct ?>%"></div>
                 </div>
-                <div class="kpi-card__meta">
-                    <img src="<?= $IMG ?>db-icon-credits.svg" alt="" />
-                    Còn <?= h($remainingCredits) ?> tín chỉ để tốt nghiệp
-                </div>
             </div>
         </div>
 
@@ -319,12 +178,7 @@ $IMG = '../../assets/img/';
         <!-- GPA Trend Chart -->
         <div class="card gpa-chart-card">
             <div class="gpa-chart-card__header">
-                <div>
-                    <div class="gpa-chart-card__title">Diễn biến GPA qua các học kỳ</div>
-                    <div class="gpa-chart-card__sub">
-                        Biểu đồ đối chiếu điểm trung bình học kỳ và tích lũy toàn khóa
-                    </div>
-                </div>
+                <div class="gpa-chart-card__title">Diễn biến GPA qua các học kỳ</div>
                 <div class="chart-tabs" role="group" aria-label="Chọn loại GPA">
                     <button class="chart-tab active" data-chart="semester" id="tabSemGpa">
                         GPA học kỳ
@@ -350,7 +204,6 @@ $IMG = '../../assets/img/';
         <div class="card degree-card" role="region" aria-label="Tiến độ tốt nghiệp">
             <div>
                 <div class="degree-card__title">Tiến độ học tập</div>
-                <div class="degree-card__sub">Tín chỉ tích lũy / tổng tín chỉ cần đạt</div>
             </div>
             <div class="degree-card__donut">
                 <div class="donut-wrap">

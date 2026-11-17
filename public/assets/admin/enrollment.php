@@ -7,6 +7,7 @@ $root = dirname(__DIR__, 3);
 require_once $root . '/src/src/helpers/auth.php';
 require_once $root . '/src/src/services/NotificationService.php';
 require_once $root . '/src/src/services/AcademicAlertService.php';
+require_once $root . '/src/src/services/RegistrationService.php';
 
 require_login();
 if ($_SESSION['role'] !== 'AcademicAffairs') { header('Location: /UniPortal/public/index.php'); exit; }
@@ -64,21 +65,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $studentId = trim($_POST['student_id'] ?? '');
         $sectionId = (int)($_POST['section_id'] ?? 0);
         if ($studentId && $sectionId) {
-            // Check capacity
-            $secRow = $pdo->prepare('SELECT capacity FROM ClassSection WHERE section_id=:sid LIMIT 1');
+            // Check section, capacity and semester credit policy.
+            $secRow = $pdo->prepare(
+                'SELECT cs.capacity, cs.semester_id, c.credits
+                 FROM ClassSection cs JOIN Course c ON c.course_id=cs.course_id
+                 WHERE cs.section_id=:sid LIMIT 1'
+            );
             $secRow->execute([':sid'=>$sectionId]);
             $sec = $secRow->fetch();
-            $enrolled = (int)$pdo->prepare('SELECT COUNT(*) FROM Enrollment WHERE section_id=:sid AND status IN (\'Enrolled\',\'Completed\')')->execute([':sid'=>$sectionId]) ? (function() use ($pdo,$sectionId) {
-                $s=$pdo->prepare('SELECT COUNT(*) FROM Enrollment WHERE section_id=:sid AND status IN (\'Enrolled\',\'Completed\')');
-                $s->execute([':sid'=>$sectionId]); return (int)$s->fetchColumn();
-            })() : 0;
+            $s = $pdo->prepare('SELECT COUNT(*) FROM Enrollment WHERE section_id=:sid AND status IN (\'Enrolled\',\'Completed\')');
+            $s->execute([':sid'=>$sectionId]);
+            $enrolled = (int)$s->fetchColumn();
 
-            $dup = $pdo->prepare('SELECT 1 FROM Enrollment WHERE student_id=:s AND section_id=:sec LIMIT 1');
+            $dup = $pdo->prepare('SELECT status FROM Enrollment WHERE student_id=:s AND section_id=:sec LIMIT 1');
             $dup->execute([':s'=>$studentId,':sec'=>$sectionId]);
-            if ($dup->fetch()) {
+            $dupRow = $dup->fetch();
+            $credit = $sec
+                ? RegistrationService::registrationSummary($pdo, $studentId, (int)$sec['semester_id'], $sectionId)
+                : null;
+
+            if (!$sec) {
+                $_SESSION['_flash'] = 'error:Lớp học phần không tồn tại.';
+            } elseif ($dupRow && $dupRow['status'] !== 'Withdrawn') {
                 $_SESSION['_flash'] = 'error:Sinh viên đã đăng ký lớp này rồi.';
             } elseif ($sec['capacity'] && $enrolled >= $sec['capacity']) {
                 $_SESSION['_flash'] = 'error:Lớp đã đầy.';
+            } elseif ($credit && $credit['registered'] + (int)$sec['credits'] > $credit['max']) {
+                $_SESSION['_flash'] = 'error:Vượt giới hạn tín chỉ: sinh viên đã đăng ký '
+                    . $credit['registered'] . ' TC, môn này ' . (int)$sec['credits'] . ' TC, tối đa '
+                    . $credit['max'] . ' TC/học kỳ. Tạo ngoại lệ tín chỉ nếu được phê duyệt.';
+            } elseif ($dupRow) {
+                $pdo->prepare("UPDATE Enrollment SET status='Enrolled', enrollment_date=NOW() WHERE student_id=:s AND section_id=:sec")
+                    ->execute([':s'=>$studentId,':sec'=>$sectionId]);
+                AcademicAlertService::writeAuditLog($pdo,$adminAccId,'ADMIN_REENROLL','Enrollment',$studentId,null,json_encode(['section_id'=>$sectionId]));
+                $_SESSION['_flash'] = 'success:Đã đăng ký lại sinh viên ' . $studentId . '.';
             } else {
                 $pdo->prepare('INSERT INTO Enrollment (student_id,section_id,status,enrollment_date) VALUES (:s,:sec,\'Enrolled\',NOW())')
                     ->execute([':s'=>$studentId,':sec'=>$sectionId]);
@@ -89,6 +109,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['_flash'] = 'error:Thiếu thông tin sinh viên hoặc lớp học phần.';
         }
         header('Location: enrollment.php?tab=enrollments&sem=' . (int)($_POST['semester_id']??4)); exit;
+    }
+
+    if ($action === 'save_credit_exception') {
+        $stuId  = trim($_POST['student_id'] ?? '');
+        $semId  = (int)($_POST['semester_id'] ?? 0);
+        $minRaw = trim((string)($_POST['min_credits'] ?? ''));
+        $maxRaw = trim((string)($_POST['max_credits'] ?? ''));
+        $res = RegistrationService::saveCreditException(
+            $pdo, $stuId, $semId,
+            $minRaw === '' ? null : (int)$minRaw,
+            $maxRaw === '' ? null : (int)$maxRaw,
+            (string)($_POST['reason'] ?? ''),
+            $adminAccId
+        );
+        $_SESSION['_flash'] = ($res['ok'] ? 'success:' : 'error:') . $res['message'];
+        header('Location: enrollment.php?tab=enrollments&sem=' . $semId); exit;
+    }
+
+    if ($action === 'delete_credit_exception') {
+        $res = RegistrationService::deleteCreditException($pdo, (int)($_POST['exception_id'] ?? 0), $adminAccId);
+        $_SESSION['_flash'] = ($res['ok'] ? 'success:' : 'error:') . $res['message'];
+        header('Location: enrollment.php?tab=enrollments&sem=' . (int)($_POST['semester_id'] ?? 0)); exit;
     }
 
     if ($action === 'update_enrollment_status') {
@@ -121,7 +163,13 @@ if ($selSem && $tab === 'enrollments') {
     $enrSt = $pdo->prepare(
         "SELECT e.enrollment_id, e.student_id, e.status, e.enrollment_date,
                 s.full_name, s.class_code,
-                cs.section_code, c.course_code, c.course_name, c.credits
+                cs.section_code, c.course_code, c.course_name, c.credits,
+                (SELECT COALESCE(SUM(c2.credits),0)
+                   FROM Enrollment e2
+                   JOIN ClassSection cs2 ON cs2.section_id = e2.section_id
+                   JOIN Course c2 ON c2.course_id = cs2.course_id
+                  WHERE e2.student_id = e.student_id AND cs2.semester_id = cs.semester_id
+                    AND e2.status IN ('Enrolled','Completed')) AS semester_credits
          FROM Enrollment e
          JOIN Student s      ON s.student_id  = e.student_id
          JOIN ClassSection cs ON cs.section_id = e.section_id
@@ -152,6 +200,22 @@ if ($selSem) {
 }
 
 $students = $pdo->query("SELECT student_id, full_name FROM Student WHERE status='Active' ORDER BY student_id")->fetchAll();
+
+$creditPolicy    = RegistrationService::creditPolicy($pdo, '', $selSem);
+$creditExceptions = [];
+if ($selSem) {
+    $q = $pdo->prepare(
+        'SELECT rce.*, s.full_name, a.username AS approver
+         FROM RegistrationCreditException rce
+         JOIN Student s ON s.student_id = rce.student_id
+         LEFT JOIN Account a ON a.account_id = rce.approved_by
+         WHERE rce.semester_id = :sem
+         ORDER BY rce.updated_at DESC, rce.student_id'
+    );
+    $q->execute([':sem' => $selSem]);
+    $creditExceptions = $q->fetchAll();
+}
+$maxCreditsGlobal = (int)$creditPolicy['max'];
 
 $warnCount  = (int)$pdo->query("SELECT COUNT(*) FROM AcademicWarning WHERE status='Active' AND is_read=FALSE")->fetchColumn();
 $pageTitle  = 'Đăng ký học phần';
@@ -288,6 +352,80 @@ if ($tab === 'semesters'):
 elseif ($tab === 'enrollments'):
 ?>
 
+<!-- Semester credit policy + exceptions -->
+<div class="acard" style="padding:16px 20px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <div style="font-size:13px;font-weight:600;color:#334155;">🎯 Giới hạn tín chỉ học kỳ</div>
+        <div style="font-size:12px;color:#64748b;">
+            Chính sách: tối thiểu <b><?= (int)$creditPolicy['min'] ?> TC</b> ·
+            tối đa <b><?= (int)$creditPolicy['max'] ?> TC</b>/học kỳ
+            <a href="config.php?tab=policy" class="abtn abtn--outline abtn--sm" style="margin-left:8px;">⚙️ Cấu hình</a>
+        </div>
+    </div>
+    <form method="POST" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <?= csrf_input() ?>
+        <input type="hidden" name="_action" value="save_credit_exception" />
+        <input type="hidden" name="semester_id" value="<?= (int)$selSem ?>" />
+        <div>
+            <label style="font-size:11px;font-weight:600;color:#334155;display:block;margin-bottom:3px;">Sinh viên *</label>
+            <select name="student_id" required style="height:36px;min-width:220px;padding:0 10px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;">
+                <option value="">— Chọn sinh viên —</option>
+                <?php foreach ($students as $sv): ?>
+                <option value="<?= h($sv['student_id']) ?>"><?= h($sv['student_id']) ?> – <?= h($sv['full_name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div>
+            <label style="font-size:11px;font-weight:600;color:#334155;display:block;margin-bottom:3px;">TC tối thiểu</label>
+            <input type="number" name="min_credits" min="0" max="60" placeholder="<?= (int)$creditPolicy['min'] ?>"
+                   style="width:110px;height:36px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;" />
+        </div>
+        <div>
+            <label style="font-size:11px;font-weight:600;color:#334155;display:block;margin-bottom:3px;">TC tối đa</label>
+            <input type="number" name="max_credits" min="1" max="60" placeholder="<?= (int)$creditPolicy['max'] ?>"
+                   style="width:110px;height:36px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;" />
+        </div>
+        <div style="flex:1;min-width:220px;">
+            <label style="font-size:11px;font-weight:600;color:#334155;display:block;margin-bottom:3px;">Lý do phê duyệt *</label>
+            <input type="text" name="reason" required maxlength="255" placeholder="VD: Kế hoạch học tập cá nhân đã được duyệt"
+                   style="width:100%;height:36px;padding:0 10px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;" />
+        </div>
+        <div style="padding-top:14px;">
+            <button type="submit" class="abtn abtn--primary abtn--sm">➕ Lưu ngoại lệ</button>
+        </div>
+    </form>
+    <?php if ($creditExceptions): ?>
+    <div class="adm-table-wrap" style="margin-top:12px;">
+        <table class="adm-table">
+            <thead><tr><th>Sinh viên</th><th style="text-align:center;">Tối thiểu</th><th style="text-align:center;">Tối đa</th><th>Lý do</th><th>Người duyệt</th><th></th></tr></thead>
+            <tbody>
+                <?php foreach ($creditExceptions as $ex): ?>
+                <tr>
+                    <td>
+                        <div style="font-weight:600;font-size:13px;color:#0d1b2e;"><?= h($ex['full_name']) ?></div>
+                        <div style="font-size:11px;color:#64748b;"><?= h($ex['student_id']) ?></div>
+                    </td>
+                    <td style="text-align:center;font-weight:700;"><?= $ex['min_credits'] !== null ? (int)$ex['min_credits'] : '—' ?></td>
+                    <td style="text-align:center;font-weight:700;"><?= $ex['max_credits'] !== null ? (int)$ex['max_credits'] : '—' ?></td>
+                    <td style="font-size:12px;color:#44474e;max-width:320px;"><?= h($ex['reason']) ?></td>
+                    <td style="font-size:12px;color:#64748b;"><?= h($ex['approver'] ?? '—') ?></td>
+                    <td>
+                        <form method="POST" style="margin:0;" onsubmit="return confirm('Xóa ngoại lệ này?')">
+                            <?= csrf_input() ?>
+                            <input type="hidden" name="_action" value="delete_credit_exception" />
+                            <input type="hidden" name="exception_id" value="<?= (int)$ex['exception_id'] ?>" />
+                            <input type="hidden" name="semester_id" value="<?= (int)$selSem ?>" />
+                            <button type="submit" class="abtn abtn--outline abtn--sm">🗑</button>
+                        </form>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php endif; ?>
+</div>
+
 <!-- Add enrollment form -->
 <div class="acard" style="padding:16px 20px;">
     <div style="font-size:13px;font-weight:600;color:#334155;margin-bottom:10px;">➕ Thêm đăng ký thủ công</div>
@@ -341,10 +479,10 @@ elseif ($tab === 'enrollments'):
 <div class="acard" style="padding:0;overflow:hidden;">
     <div class="adm-table-wrap">
         <table class="adm-table">
-            <thead><tr><th>Sinh viên</th><th>Lớp học phần</th><th>Môn học</th><th style="text-align:center;">TC</th><th>Ngày ĐK</th><th>Trạng thái</th><th></th></tr></thead>
+            <thead><tr><th>Sinh viên</th><th style="text-align:center;">TC kỳ</th><th>Lớp học phần</th><th>Môn học</th><th style="text-align:center;">TC</th><th>Ngày ĐK</th><th>Trạng thái</th><th></th></tr></thead>
             <tbody>
                 <?php if (empty($enrollments)): ?>
-                <tr><td colspan="7" style="text-align:center;padding:32px;color:#94a3b8;font-style:italic;">Không có dữ liệu đăng ký.</td></tr>
+                <tr><td colspan="8" style="text-align:center;padding:32px;color:#94a3b8;font-style:italic;">Không có dữ liệu đăng ký.</td></tr>
                 <?php else: ?>
                 <?php foreach ($enrollments as $e):
                     $stColor = ['Enrolled'=>'apill--green','Completed'=>'apill--blue','Withdrawn'=>'apill--gray'][$e['status']] ?? 'apill--gray';
@@ -354,6 +492,9 @@ elseif ($tab === 'enrollments'):
                     <td>
                         <div style="font-weight:600;font-size:13px;color:#0d1b2e;"><?= h($e['full_name']) ?></div>
                         <div style="font-size:11px;color:#64748b;"><?= h($e['student_id']) ?> • <?= h($e['class_code']) ?></div>
+                    </td>
+                    <td style="text-align:center;font-weight:700;font-size:12px;color:<?= (int)$e['semester_credits'] > $maxCreditsGlobal ? '#dc2626' : '#0d1b2e' ?>;">
+                        <?= (int)$e['semester_credits'] ?>
                     </td>
                     <td style="font-family:monospace;font-size:12px;"><?= h($e['section_code']) ?></td>
                     <td style="font-size:12px;color:#44474e;"><?= h($e['course_code']) ?> – <?= h($e['course_name']) ?></td>

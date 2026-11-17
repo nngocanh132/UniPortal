@@ -6,7 +6,9 @@
 $root = dirname(__DIR__, 3);
 require_once $root . '/src/src/helpers/auth.php';
 require_once $root . '/src/src/models/Lecturer.php';
+require_once $root . '/src/src/models/TeachingSchedule.php';
 require_once $root . '/src/src/services/AcademicAlertService.php';
+require_once $root . '/src/src/services/AttendanceService.php';
 
 require_lecturer();
 if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
@@ -47,10 +49,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// ── Selected section & session ────────────────────────────────
-$selSection = (int)($_GET['section'] ?? ($sections[0]['section_id'] ?? 0));
+// ── Selected section & session (chosen from the teaching schedule) ──
+$selSection = (int)($_GET['section'] ?? 0);
 if (!in_array($selSection, array_map(fn($s) => (int)$s['section_id'], $sections), true)) {
-    $selSection = (int)($sections[0]['section_id'] ?? 0);
+    $selSection = 0;
 }
 $selSession = (int)($_GET['session'] ?? 0);
 
@@ -60,12 +62,6 @@ foreach ($sections as $s) {
 }
 
 $sessions = $selSection ? LecturerModel::getAttendanceSessions($selSection) : [];
-if (!$selSession && !empty($sessions)) {
-    foreach ($sessions as $sess) {
-        if ($sess['status'] === 'Scheduled') { $selSession = (int)$sess['session_id']; break; }
-    }
-    if (!$selSession) $selSession = (int)$sessions[0]['session_id'];
-}
 
 $selSessionInfo = null;
 $rosterRows = [];
@@ -107,6 +103,16 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv' && $selSectionInfo) {
     exit;
 }
 
+// Eligibility statistics (official sessions, shared with student/admin views)
+$sectionAtt = [];
+$attByEnrollment = [];
+if ($selSection) {
+    $sectionAtt = AttendanceService::sectionSummary(get_db(), $selSection);
+    foreach ($sectionAtt['students'] as $st) {
+        $attByEnrollment[(int)$st['enrollment_id']] = $st;
+    }
+}
+
 // Stats
 $presentCount = count(array_filter($rosterRows, fn($r) => $r['att_status'] === 'Present'));
 $absentCount  = count(array_filter($rosterRows, fn($r) => $r['att_status'] === 'Absent'));
@@ -114,6 +120,27 @@ $lateCount    = count(array_filter($rosterRows, fn($r) => $r['att_status'] === '
 $excusedCount = count(array_filter($rosterRows, fn($r) => $r['att_status'] === 'Excused'));
 $totalSV      = count($rosterRows);
 $attRate      = $totalSV > 0 ? round(($presentCount + $lateCount + $excusedCount) / $totalSV * 100, 1) : 0;
+
+// ── Official teaching schedule (the single session picker) ────
+$today = date('Y-m-d');
+$allSessions = $semId ? TeachingSchedule::getLecturerSessions($lecId, $semId) : [];
+$sessionsBySection = [];
+foreach ($allSessions as $sched) {
+    $sessionsBySection[(int)$sched['section_id']][] = $sched;
+}
+
+$defaultOpenSection = 0;
+foreach (['today', 'upcoming'] as $probe) {
+    foreach ($sections as $s) {
+        foreach ($sessionsBySection[(int)$s['section_id']] ?? [] as $row) {
+            if ($row['status'] === 'Cancelled') continue;
+            $hit = $probe === 'today' ? $row['session_date'] === $today : $row['session_date'] > $today;
+            if ($hit) { $defaultOpenSection = (int)$s['section_id']; break 2; }
+        }
+    }
+    if ($defaultOpenSection) break;
+}
+if (!$defaultOpenSection) $defaultOpenSection = (int)($sections[0]['section_id'] ?? 0);
 
 $pageTitle  = 'Quản lý điểm danh';
 $activePage = 'grading';
@@ -123,14 +150,33 @@ function initials(string $n): string {
     $r=''; foreach(explode(' ',trim($n)) as $w) $r.=strtoupper(substr($w,0,1));
     return substr($r,-2);
 }
+
+function att_day_label(string $date): string {
+    return TeachingSchedule::DAY_SHORT[(int)date('N', strtotime($date))] ?? date('D', strtotime($date));
+}
+
+/** Today first, then upcoming, then past (most recent first), cancelled last. */
+function att_order_sessions(array $rows, string $today): array {
+    $todayRows = $upcoming = $past = $cancelled = [];
+    foreach ($rows as $row) {
+        if ($row['status'] === 'Cancelled') { $cancelled[] = $row; }
+        elseif ($row['session_date'] === $today) { $todayRows[] = $row; }
+        elseif ($row['session_date'] > $today) { $upcoming[] = $row; }
+        else { $past[] = $row; }
+    }
+    return array_merge($todayRows, $upcoming, array_reverse($past), $cancelled);
+}
 ?>
 
-<!-- ═══════════ ACTIONS ══════════════════════════════════════ -->
-<div style="display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;">
-    <a href="schedule.php<?= $selSection ? '?section=' . (int)$selSection : '' ?>" class="lbtn lbtn--outline">🗓️ Lịch giảng dạy</a>
-    <a href="#attHistory" class="lbtn lbtn--outline">📅 Lịch sử</a>
-    <a href="?section=<?= (int)$selSection ?><?= $selSessionInfo ? '&amp;session='.(int)$selSession : '' ?>&amp;export=csv" class="lbtn lbtn--outline">📊 Xuất CSV</a>
+<?php if ($selSessionInfo): ?>
+<div class="att-topbar">
+    <a href="grading.php" class="lbtn lbtn--outline lbtn--sm">← Chọn buổi khác</a>
+    <div class="att-topbar__actions">
+        <a href="schedule.php?section=<?= (int)$selSection ?>" class="lbtn lbtn--outline lbtn--sm">🗓️ Lịch giảng dạy</a>
+        <a href="?section=<?= (int)$selSection ?>&amp;session=<?= (int)$selSession ?>&amp;export=csv" class="lbtn lbtn--outline lbtn--sm">📊 Xuất CSV</a>
+    </div>
 </div>
+<?php endif; ?>
 
 <?php if ($flash): [$ftype, $fmsg] = explode(':', $flash, 2); ?>
 <div class="lec-flash lec-flash--<?= $ftype === 'success' ? 'success' : 'error' ?>">
@@ -138,69 +184,35 @@ function initials(string $n): string {
 </div>
 <?php endif; ?>
 
-<!-- ═══════════ SECTION + SESSION SELECTOR ═══════════════════ -->
-<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
-    <span style="font-size:13px;font-weight:600;color:#64748b;">Học phần &amp; Lớp:</span>
-    <?php foreach ($sections as $s): ?>
-    <a href="?section=<?= (int)$s['section_id'] ?>"
-       class="lpill <?= (int)$s['section_id'] === $selSection ? 'lpill--blue' : 'lpill--gray' ?>">
-        <?= htmlspecialchars($s['section_code']) ?>
-    </a>
-    <?php endforeach; ?>
-    <?php if (!empty($sessions)): ?>
-    <span style="color:#e2e8f0;">|</span>
-    <span style="font-size:13px;font-weight:600;color:#64748b;">Buổi học:</span>
-    <?php foreach ($sessions as $sess):
-        $isCancelledPill = $sess['status'] === 'Cancelled';
-        $pillCls = $isCancelledPill ? 'lpill--red'
-            : ((int)$sess['session_id'] === $selSession ? 'lpill--blue' : 'lpill--gray');
-        $mark = $isCancelledPill ? ' ✕' : ($sess['session_type'] === 'Makeup' ? ' ↩' : '');
-        $title = date('d/m/Y', strtotime($sess['session_date'])) . ' ' . substr($sess['start_time'], 0, 5) .
-                 ($isCancelledPill ? ' – Đã hủy' : ($sess['session_type'] === 'Makeup' ? ' – Học bù' : ''));
-    ?>
-    <a href="?section=<?= (int)$selSection ?>&session=<?= (int)$sess['session_id'] ?>"
-       title="<?= htmlspecialchars($title) ?>"
-       class="lpill <?= $pillCls ?>" style="<?= $isCancelledPill ? 'text-decoration:line-through;' : '' ?>">
-        <?= date('d/m', strtotime($sess['session_date'])) ?>
-        <?= date('H:i', strtotime($sess['start_time'])) ?><?= $mark ?>
-    </a>
-    <?php endforeach; ?>
-    <?php endif; ?>
-</div>
+<?php if ($selSessionInfo): ?>
 
-<?php if ($selSectionInfo && $selSessionInfo): ?>
-
-<!-- ═══════════ SESSION INFO BAR ═════════════════════════════ -->
-<div class="lec-section-banner">
-    <div class="lec-section-banner__info">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-            <span style="font-size:11px;font-weight:700;background:rgba(253,204,53,.3);color:#fff;padding:2px 8px;border-radius:4px;">
-                Ngày giảng dạy: <?= date('d/m/Y', strtotime($selSessionInfo['session_date'])) ?>
-            </span>
-            <?php if ($selSessionInfo['status'] === 'Cancelled'): ?>
-            <span class="lpill lpill--red" style="font-size:10px;">🚫 Buổi học đã hủy</span>
-            <?php elseif ($selSessionInfo['session_type'] === 'Makeup'): ?>
-            <span class="lpill lpill--blue" style="font-size:10px;">🔁 Buổi học bù</span>
-            <?php endif; ?>
-            <?php if ((int)$selSessionInfo['pending_requests'] > 0): ?>
-            <span class="lpill lpill--orange" style="font-size:10px;">⏳ Chờ duyệt thay đổi</span>
-            <?php endif; ?>
-            <?php if ($selSessionInfo['recorded_count'] < 1): ?>
-            <span class="lpill" style="background:rgba(239,68,68,.2);color:#fca5a5;font-size:10px;">Chưa chốt sổ điểm danh</span>
-            <?php else: ?>
-            <span class="lpill" style="background:rgba(34,197,94,.2);color:#86efac;font-size:10px;">Đã chốt</span>
-            <?php endif; ?>
+<!-- ═══════════ SELECTED SESSION ══════════════════════════════ -->
+<div class="lcard att-session-head">
+    <div>
+        <div class="att-session-head__title">
+            <span class="att-session-head__course"><?= htmlspecialchars($selSectionInfo['course_code']) ?> – <?= htmlspecialchars($selSectionInfo['course_name']) ?></span>
+            <span class="lpill lpill--gray"><?= htmlspecialchars($selSectionInfo['section_code']) ?></span>
         </div>
-        <span class="lec-section-banner__code"><?= htmlspecialchars($selSectionInfo['section_code']) ?></span>
-        <span class="lec-section-banner__name"><?= htmlspecialchars($selSectionInfo['course_name']) ?></span>
-        <div class="lec-section-banner__meta">
-            <span>📚 Học phần &amp; Lớp: <?= htmlspecialchars($selSectionInfo['section_code']) ?></span>
-            <span>🕐 Khung giờ &amp; Địa điểm: <?= date('H:i', strtotime($selSessionInfo['start_time'])) ?>–<?= date('H:i', strtotime($selSessionInfo['end_time'])) ?> • <?= htmlspecialchars($selSessionInfo['room'] ?? ($selSectionInfo['room'] ?? 'TBA')) ?></span>
-            <span>📋 Trạng thái sổ điểm danh: <?= $selSessionInfo['status'] === 'Cancelled' ? 'Buổi học đã hủy – không thể điểm danh' : ($selSessionInfo['recorded_count'] > 0 ? 'Đã chốt' : 'Chưa chốt sổ điểm danh') ?></span>
+        <div class="att-session-head__meta">
+            <span>📅 <?= $selSessionInfo['session_no'] !== null ? 'Buổi ' . (int)$selSessionInfo['session_no'] : ($selSessionInfo['session_type'] === 'Makeup' ? 'Buổi học bù' : 'Buổi học') ?> · <?= date('d/m/Y', strtotime($selSessionInfo['session_date'])) ?> (<?= att_day_label($selSessionInfo['session_date']) ?>)</span>
+            <span>🕐 <?= substr($selSessionInfo['start_time'], 0, 5) ?>–<?= substr($selSessionInfo['end_time'], 0, 5) ?></span>
+            <span>📍 <?= htmlspecialchars($selSessionInfo['room'] ?: ($selSectionInfo['room'] ?? '')) ?: 'Chưa xếp phòng' ?></span>
         </div>
     </div>
-    <div class="lec-section-banner__actions">
-        <a href="schedule.php?section=<?= (int)$selSection ?>" class="lbtn lbtn--outline" style="color:#fff;border-color:rgba(255,255,255,.3);">🗓️ Lịch giảng dạy</a>
+    <div class="att-session-head__pills">
+        <?php if ($selSessionInfo['status'] === 'Cancelled'): ?>
+        <span class="lpill lpill--red">🚫 Đã hủy</span>
+        <?php elseif ($selSessionInfo['session_type'] === 'Makeup'): ?>
+        <span class="lpill lpill--blue">🔁 Học bù</span>
+        <?php endif; ?>
+        <?php if ((int)$selSessionInfo['pending_requests'] > 0): ?>
+        <span class="lpill lpill--orange">⏳ Chờ duyệt thay đổi</span>
+        <?php endif; ?>
+        <?php if ($selSessionInfo['recorded_count'] > 0): ?>
+        <span class="lpill lpill--green">✅ Đã điểm danh <?= (int)$selSessionInfo['recorded_count'] ?>/<?= $totalSV ?></span>
+        <?php else: ?>
+        <span class="lpill lpill--gray">Chưa điểm danh</span>
+        <?php endif; ?>
     </div>
 </div>
 
@@ -212,48 +224,8 @@ function initials(string $n): string {
 <?php endif; ?>
 
 <?php if ($selSessionInfo['status'] !== 'Cancelled'): ?>
-<!-- ═══════════ STAT CARDS ════════════════════════════════════ -->
-<div class="lec-grade-summary">
-    <div class="lcard" style="padding:16px 12px;text-align:center;">
-        <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.3px;margin-bottom:4px;">Sĩ số lớp</div>
-        <img src="../img/db-icon-credits.svg" alt="" style="width:20px;margin:4px auto;" />
-        <div style="font-size:26px;font-weight:800;color:#001634;"><?= $totalSV ?></div>
-        <div style="font-size:11px;color:#94a3b8;">sinh viên</div>
-    </div>
-    <div class="lcard" style="padding:16px;border-left:4px solid #22c55e;">
-        <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">Có mặt ✅</div>
-        <div style="font-size:32px;font-weight:800;color:#166534;"><?= $presentCount ?></div>
-        <div style="font-size:12px;color:#94a3b8;"><?= $attRate ?>%</div>
-        <div style="height:4px;background:#dcfce7;border-radius:9999px;margin-top:6px;overflow:hidden;">
-            <div style="height:100%;width:<?= $attRate ?>%;background:#22c55e;border-radius:9999px;"></div>
-        </div>
-    </div>
-    <div class="lcard" style="padding:16px;border-left:4px solid #ef4444;">
-        <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">Vắng không phép ❌</div>
-        <div style="font-size:32px;font-weight:800;color:#b91c1c;"><?= $absentCount ?></div>
-        <div style="font-size:12px;color:#94a3b8;"><?= $totalSV > 0 ? round($absentCount/$totalSV*100,1) : 0 ?>%</div>
-    </div>
-    <div class="lcard" style="padding:16px;border-left:4px solid #6366f1;">
-        <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">Vắng có phép 📝</div>
-        <div style="font-size:32px;font-weight:800;color:#4338ca;"><?= $excusedCount ?></div>
-        <div style="font-size:12px;color:#94a3b8;"><?= $totalSV > 0 ? round($excusedCount/$totalSV*100,1) : 0 ?>%</div>
-    </div>
-    <div class="lcard" style="padding:16px;border-left:4px solid #f59e0b;">
-        <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">Đi muộn ⏰</div>
-        <div style="font-size:32px;font-weight:800;color:#92400e;"><?= $lateCount ?></div>
-        <div style="font-size:12px;color:#94a3b8;"><?= $totalSV > 0 ? round($lateCount/$totalSV*100,1) : 0 ?>%</div>
-    </div>
-    <div class="lcard" style="padding:16px;">
-        <div style="font-size:12px;font-weight:700;color:#001634;margin-bottom:8px;">⚡ Tác vụ nhanh</div>
-        <div style="display:flex;flex-direction:column;gap:5px;">
-            <button type="button" onclick="markAll('Present')" class="lbtn lbtn--green lbtn--sm">✅ Điểm danh tất cả có mặt</button>
-            <button type="button" onclick="markAll('Absent')" class="lbtn lbtn--outline lbtn--sm">❌ Đánh dấu tất cả vắng</button>
-        </div>
-    </div>
-</div>
-
-<!-- ═══════════ STATUS TABS ═══════════════════════════════════ -->
-<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+<!-- ═══════════ STATUS TABS + QUICK ACTIONS ═══════════════════ -->
+<div class="att-toolbar">
     <div class="lec-tabs" id="attTabs">
         <button type="button" class="lec-tab active" data-filter="all">Tất cả (<?= $totalSV ?>)</button>
         <button type="button" class="lec-tab" data-filter="Present">Có mặt (<?= $presentCount ?>)</button>
@@ -261,10 +233,13 @@ function initials(string $n): string {
         <button type="button" class="lec-tab" data-filter="Excused">Vắng có phép (<?= $excusedCount ?>)</button>
         <button type="button" class="lec-tab" data-filter="Late">Đi muộn (<?= $lateCount ?>)</button>
     </div>
-    <div style="position:relative;">
-        <img src="../img/icon-search.svg" alt="" style="position:absolute;left:10px;top:50%;transform:translateY(-50%);width:13px;opacity:.4;" />
-        <input type="search" id="attSearch" placeholder="Tìm tên sinh viên, MSSV..."
-               style="width:220px;height:34px;background:#f1f5f9;border:none;border-radius:8px;padding:0 12px 0 30px;font-size:13px;outline:none;" />
+    <div class="att-toolbar__right">
+        <button type="button" onclick="markAll('Present')" class="lbtn lbtn--green lbtn--sm">✅ Tất cả có mặt</button>
+        <button type="button" onclick="markAll('Absent')" class="lbtn lbtn--outline lbtn--sm">❌ Tất cả vắng</button>
+        <div class="att-search">
+            <img src="../img/icon-search.svg" alt="" />
+            <input type="search" id="attSearch" placeholder="Tìm tên sinh viên, MSSV..." />
+        </div>
     </div>
 </div>
 
@@ -281,7 +256,7 @@ function initials(string $n): string {
                     <tr>
                         <th style="width:44px;text-align:center;">STT</th>
                         <th>Học viên & MSSV</th>
-                        <th style="width:300px;">Điểm danh buổi <?= date('d/m/Y', strtotime($selSessionInfo['session_date'])) ?></th>
+                        <th style="width:300px;">Điểm danh <?= $selSessionInfo['session_no'] !== null ? 'buổi ' . (int)$selSessionInfo['session_no'] . ' – ' : '' ?><?= date('d/m/Y', strtotime($selSessionInfo['session_date'])) ?></th>
                         <th>Ghi chú ca học</th>
                         <th>Tỷ lệ vắng</th>
                         <th>Chuyên cần môn</th>
@@ -297,25 +272,39 @@ function initials(string $n): string {
                     <?php foreach ($rosterRows as $i => $row):
                         $ini      = initials($row['full_name']);
                         $curAtt   = $row['att_status'] ?? '';
-                        $totAbs   = (int)$row['total_absent'];
-                        $totSess  = max(1,(int)$row['total_sessions']);
-                        $absPct   = round($totAbs/$totSess*100, 1);
-                        $attPct   = round((1 - $totAbs/$totSess)*100, 1);
-                        $barCls   = $attPct >= 90 ? 'ok' : ($attPct >= 80 ? 'warn' : 'crit');
-                        $riskLbl  = $attPct < 80 ? '🚨 Cấm thi' : ($attPct < 90 ? '⚠️ Cần nhắc nhở' : '✅ An toàn');
-                        $riskCls  = $attPct < 80 ? 'lpill--red' : ($attPct < 90 ? 'lpill--orange' : 'lpill--green');
+                        $stat     = $attByEnrollment[(int)$row['enrollment_id']] ?? null;
+                        $eligibleOfficial = (int)($stat['official_total'] ?? 0);
+                        $totAbs   = (int)($stat['absent_counted'] ?? 0);
+                        $absPct   = (float)($stat['absent_pct'] ?? 0);
+                        $remaining= (int)($stat['remaining_allowed'] ?? 0);
+                        $attPct   = $eligibleOfficial > 0 ? round(100 - $absPct, 1) : 0;
+                        $status   = $stat['status'] ?? 'no_data';
+
+                        if ($status === 'ineligible') {
+                            $barCls='crit'; $riskLbl='🚫 Không đủ ĐK dự thi'; $riskCls='lpill--red';
+                        } elseif ((int)($stat['risk_level'] ?? 0) === 2) {
+                            $barCls='crit'; $riskLbl='⚠️ Chạm ngưỡng cấm thi'; $riskCls='lpill--red';
+                        } elseif ($status === 'at_risk') {
+                            $barCls='warn'; $riskLbl='⚠️ Nguy cơ mất ĐK'; $riskCls='lpill--orange';
+                        } elseif ($status === 'no_data') {
+                            $barCls='warn'; $riskLbl='— Chưa có buổi'; $riskCls='lpill--gray';
+                        } else {
+                            $barCls='ok'; $riskLbl='✅ Đủ điều kiện'; $riskCls='lpill--green';
+                        }
+                        $rowHighlight = $status === 'ineligible'
+                            || (int)($stat['risk_level'] ?? 0) === 2;
                     ?>
-                    <tr data-status="<?= htmlspecialchars($curAtt ?: 'Present') ?>" style="<?= $absPct >= 20 ? 'background:#fff5f5;' : '' ?>">
-                        <td style="text-align:center;font-size:12px;color:#94a3b8;font-weight:<?= $absPct>=20?'800':'400' ?>;color:<?= $absPct>=20?'#ef4444':'#94a3b8' ?>;">
+                    <tr data-status="<?= htmlspecialchars($curAtt ?: 'Present') ?>" style="<?= $rowHighlight ? 'background:#fff5f5;' : '' ?>">
+                        <td style="text-align:center;font-size:12px;color:#94a3b8;font-weight:<?= $rowHighlight?'800':'400' ?>;color:<?= $rowHighlight?'#ef4444':'#94a3b8' ?>;">
                             <?= str_pad($i+1,2,'0',STR_PAD_LEFT) ?>
                         </td>
                         <td>
                             <div style="display:flex;align-items:center;gap:8px;">
                                 <span class="lec-av" style="width:32px;height:32px;"><?= htmlspecialchars($ini) ?></span>
                                 <div>
-                                    <div style="font-weight:700;font-size:13px;color:<?= $absPct>=20?'#b91c1c':'#001634' ?>;">
+                                    <div style="font-weight:700;font-size:13px;color:<?= $rowHighlight?'#b91c1c':'#001634' ?>;">
                                         <?= htmlspecialchars($row['full_name']) ?>
-                                        <?php if ($absPct>=20): ?><span style="color:#ef4444;font-size:10px;"> △</span><?php endif; ?>
+                                        <?php if ($rowHighlight): ?><span style="color:#ef4444;font-size:10px;"> △</span><?php endif; ?>
                                     </div>
                                     <div style="font-size:11px;color:#64748b;"><?= htmlspecialchars($row['student_id']) ?></div>
                                 </div>
@@ -350,21 +339,21 @@ function initials(string $n): string {
                                    style="width:160px;height:30px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:0 8px;font-size:12px;outline:none;" />
                         </td>
                         <td>
-                            <div style="font-size:12px;font-weight:700;color:<?= $absPct>=20?'#b91c1c':'#44474e' ?>;">
-                                <?= $totAbs ?>/<?= $totSess ?> buổi
+                            <div style="font-size:12px;font-weight:700;color:<?= $rowHighlight?'#b91c1c':'#44474e' ?>;">
+                                <?= $totAbs ?>/<?= $eligibleOfficial ?> buổi
                             </div>
-                            <div style="font-size:11px;color:#94a3b8;">(<?= $absPct ?>% vắng)</div>
+                            <div style="font-size:11px;color:#94a3b8;">(<?= number_format($absPct,1) ?>% vắng · còn <?= $remaining ?> buổi phép)</div>
                         </td>
                         <td>
                             <div class="att-bar-wrap" style="min-width:80px;">
                                 <div class="att-bar">
                                     <div class="att-bar__fill att-bar__fill--<?= $barCls ?>" style="width:<?= $attPct ?>%"></div>
                                 </div>
-                                <span class="att-pct att-pct--<?= $barCls ?>"><?= $attPct ?>%</span>
+                                <span class="att-pct att-pct--<?= $barCls ?>"><?= $eligibleOfficial > 0 ? $attPct.'%' : '—' ?></span>
                             </div>
-                            <div style="font-size:11px;color:#94a3b8;margin-top:2px;">Xuất sắc</div>
+                            <div style="font-size:11px;color:#94a3b8;margin-top:2px;"><?= $eligibleOfficial > 0 ? (int)$stat['completed_total'].'/'.$eligibleOfficial.' buổi đã dạy' : 'Chưa có buổi chính thức' ?></div>
                         </td>
-                        <td><span class="lpill <?= $riskCls ?>" style="font-size:11px;"><?= $riskLbl ?></span></td>
+                        <td><span class="lpill <?= $riskCls ?>" style="font-size:11px;" title="<?= htmlspecialchars($stat['explanation'] ?? '') ?>"><?= $riskLbl ?></span></td>
                     </tr>
                     <?php endforeach; ?>
                     <?php endif; ?>
@@ -392,11 +381,14 @@ function initials(string $n): string {
 <div class="lcard" id="attHistory" style="padding:0;overflow:hidden;">
     <div style="padding:14px 16px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
         <div style="font-size:14px;font-weight:700;color:#001634;">📅 Lịch sử điểm danh – <?= htmlspecialchars($selSectionInfo['section_code']) ?></div>
-        <span style="font-size:12px;color:#64748b;"><?= count($sessions) ?> buổi học</span>
+        <div style="display:flex;align-items:center;gap:10px;">
+            <span style="font-size:12px;color:#64748b;"><?= count($sessions) ?> buổi học</span>
+            <a href="?section=<?= (int)$selSection ?>&amp;export=csv" class="lbtn lbtn--outline lbtn--sm">📊 CSV cả lớp</a>
+        </div>
     </div>
     <div class="lec-table-wrap">
         <table class="lec-table">
-            <thead><tr><th>NGÀY</th><th>GIỜ</th><th>CHỦ ĐỀ</th><th>TRẠNG THÁI</th><th style="text-align:center;">ĐÃ ĐIỂM DANH</th><th style="text-align:center;">CÓ MẶT</th><th style="text-align:center;">VẮNG</th><th style="text-align:center;">MUỘN</th><th style="text-align:center;">CÓ PHÉP</th><th></th></tr></thead>
+            <thead><tr><th>BUỔI</th><th>NGÀY</th><th>GIỜ</th><th>CHỦ ĐỀ</th><th>TRẠNG THÁI</th><th style="text-align:center;">ĐÃ ĐIỂM DANH</th><th style="text-align:center;">CÓ MẶT</th><th style="text-align:center;">VẮNG</th><th style="text-align:center;">MUỘN</th><th style="text-align:center;">CÓ PHÉP</th></tr></thead>
             <tbody>
                 <?php if (empty($sessions)): ?>
                 <tr><td colspan="10" style="text-align:center;padding:28px;color:#94a3b8;font-style:italic;">Chưa có buổi học nào.</td></tr>
@@ -413,6 +405,9 @@ function initials(string $n): string {
                     }
                 ?>
                 <tr<?= (int)$h['session_id'] === $selSession ? ' style="background:#f0f9ff;"' : '' ?>>
+                    <td style="font-size:12px;font-weight:700;color:#001634;text-align:center;">
+                        <?= $h['session_no'] !== null ? (int)$h['session_no'] : '<span style="font-size:10px;color:#3b82f6;">Bù</span>' ?>
+                    </td>
                     <td style="font-size:12px;font-weight:600;color:#001634;<?= $h['status'] === 'Cancelled' ? 'text-decoration:line-through;' : '' ?>"><?= date('d/m/Y', strtotime($h['session_date'])) ?></td>
                     <td style="font-size:12px;color:#64748b;"><?= substr($h['start_time'],0,5) ?>–<?= substr($h['end_time'],0,5) ?></td>
                     <td style="font-size:12px;color:#44474e;"><?= htmlspecialchars($h['topic'] ?? '—') ?></td>
@@ -422,7 +417,6 @@ function initials(string $n): string {
                     <td style="text-align:center;font-weight:700;color:#b91c1c;"><?= (int)$h['absent_count'] ?></td>
                     <td style="text-align:center;font-weight:700;color:#92400e;"><?= (int)$h['late_count'] ?></td>
                     <td style="text-align:center;font-weight:700;color:#5b21b6;"><?= (int)$h['excused_count'] ?></td>
-                    <td><a href="?section=<?= (int)$selSection ?>&session=<?= (int)$h['session_id'] ?>" class="lbtn lbtn--outline lbtn--sm">Mở</a></td>
                 </tr>
                 <?php endforeach; ?>
                 <?php endif; ?>
@@ -432,19 +426,115 @@ function initials(string $n): string {
 </div>
 
 <?php else: ?>
-<div class="lcard">
+<!-- ═══════════ TEACHING SCHEDULE (session picker) ═══════════ -->
+<div class="lcard" style="padding:0;overflow:hidden;">
+    <div class="att-picker__head">
+        <div>
+            <div class="att-picker__title">🗓️ Lịch giảng dạy</div>
+            <div class="att-picker__sub">Chọn lớp để xem các buổi học, sau đó chọn một buổi để điểm danh. Lịch được tạo tự động từ lịch chính thức của Phòng Đào tạo.</div>
+        </div>
+        <a href="schedule.php" class="lbtn lbtn--outline lbtn--sm">Xem lịch đầy đủ</a>
+    </div>
+
+    <?php if (empty($sections)): ?>
     <div class="lec-empty">
         <div class="lec-empty__icon">📋</div>
-        <p>
-            <?php if (empty($sections)): ?>
-            Chưa có lớp học phần nào trong học kỳ hiện tại.
-            <?php elseif (empty($sessions)): ?>
-            Chưa có buổi học nào được xếp cho lớp này. Buổi học được tạo tự động từ lịch giảng dạy chính thức do Phòng Đào tạo thiết lập.
-            <?php else: ?>
-            Chọn lớp và buổi học ở trên để bắt đầu điểm danh.
-            <?php endif; ?>
-        </p>
+        <p>Chưa có lớp học phần nào trong học kỳ hiện tại.</p>
     </div>
+    <?php else: foreach ($sections as $s):
+        $sid = (int)$s['section_id'];
+        $group = $sessionsBySection[$sid] ?? [];
+        $ordered = att_order_sessions($group, $today);
+        $recordedSessions = count(array_filter($group, fn($r) => $r['status'] !== 'Cancelled' && (int)$r['recorded_count'] > 0));
+        $weekly = trim((string)($s['schedule'] ?? ''));
+    ?>
+    <details class="att-class"<?= $sid === $defaultOpenSection ? ' open' : '' ?>>
+        <summary>
+            <span class="att-class__chev">›</span>
+            <span class="att-class__title">
+                <span class="att-class__course"><?= htmlspecialchars($s['course_code']) ?> – <?= htmlspecialchars($s['course_name']) ?></span>
+                <span class="att-class__meta">
+                    Lớp <?= htmlspecialchars($s['section_code']) ?>
+                    <?= $weekly !== '' ? ' • ' . htmlspecialchars($weekly) : '' ?>
+                    <?= !empty($s['room']) ? ' • 📍 ' . htmlspecialchars($s['room']) : '' ?>
+                </span>
+            </span>
+            <span class="att-class__count"><?= count($group) ?> buổi · <?= $recordedSessions ?> đã điểm danh</span>
+        </summary>
+        <div class="att-class__body">
+            <?php if (empty($ordered)): ?>
+            <div class="att-class__empty">Chưa có buổi học nào được xếp cho lớp này.</div>
+            <?php else: ?>
+            <div class="lec-table-wrap">
+                <table class="lec-table att-sched-table">
+                    <thead>
+                        <tr>
+                            <th>Ngày</th>
+                            <th>Buổi</th>
+                            <th>Giờ</th>
+                            <th>Phòng</th>
+                            <th>Chủ đề</th>
+                            <th style="text-align:center;">Điểm danh</th>
+                            <th>Trạng thái</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach ($ordered as $row):
+                        $isCancelled = $row['status'] === 'Cancelled';
+                        $isToday = $row['session_date'] === $today;
+                        $rec = (int)$row['recorded_count'];
+                        $tot = (int)$row['total_students'];
+
+                        if ($isCancelled) {
+                            $stLbl = 'Đã hủy'; $stCls = 'lpill--red';
+                        } elseif ((int)$row['pending_cancel'] > 0) {
+                            $stLbl = 'Chờ duyệt nghỉ'; $stCls = 'lpill--orange';
+                        } elseif ((int)$row['pending_makeup'] > 0) {
+                            $stLbl = 'Chờ duyệt học bù'; $stCls = 'lpill--orange';
+                        } elseif ($row['session_type'] === 'Makeup') {
+                            $stLbl = 'Học bù'; $stCls = 'lpill--blue';
+                        } elseif ($rec > 0) {
+                            $stLbl = 'Đã điểm danh'; $stCls = 'lpill--green';
+                        } else {
+                            $stLbl = 'Chưa điểm danh'; $stCls = 'lpill--gray';
+                        }
+                        $rowCls = $isCancelled ? 'att-row--cancelled' : ($isToday ? 'att-row--today' : '');
+                    ?>
+                    <tr class="<?= $rowCls ?>">
+                        <td data-label="Ngày">
+                            <span class="att-date"><?= date('d/m/Y', strtotime($row['session_date'])) ?><small><?= att_day_label($row['session_date']) ?><?= $isToday ? ' · Hôm nay' : '' ?></small></span>
+                        </td>
+                        <td class="att-muted" data-label="Buổi"><?= $row['session_no'] !== null ? 'Buổi ' . (int)$row['session_no'] : ($row['session_type'] === 'Makeup' ? 'Học bù' : '—') ?></td>
+                        <td class="att-muted" data-label="Giờ"><?= substr($row['start_time'], 0, 5) ?>–<?= substr($row['end_time'], 0, 5) ?></td>
+                        <td class="att-muted" data-label="Phòng"><?= !empty($row['room']) ? htmlspecialchars($row['room']) : '—' ?></td>
+                        <td class="att-muted" data-label="Chủ đề"><?= !empty($row['topic']) ? htmlspecialchars($row['topic']) : '—' ?></td>
+                        <td style="text-align:center;" data-label="Điểm danh">
+                            <?php if ($isCancelled): ?>
+                            <span class="att-muted">—</span>
+                            <?php elseif ($rec > 0): ?>
+                            <span class="lpill lpill--green" style="font-size:10px;">✅ <?= $rec ?>/<?= $tot ?></span>
+                            <?php else: ?>
+                            <span class="lpill lpill--gray" style="font-size:10px;">Chưa</span>
+                            <?php endif; ?>
+                        </td>
+                        <td data-label="Trạng thái"><span class="lpill <?= $stCls ?>" style="font-size:10px;"><?= $stLbl ?></span></td>
+                        <td style="text-align:right;">
+                            <?php if ($isCancelled): ?>
+                            <span class="att-muted" style="font-size:11px;">Không thể điểm danh</span>
+                            <?php else: ?>
+                            <a href="?section=<?= $sid ?>&amp;session=<?= (int)$row['session_id'] ?>" class="lbtn lbtn--yellow lbtn--sm">Điểm danh</a>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php endif; ?>
+        </div>
+    </details>
+    <?php endforeach; endif; ?>
 </div>
 <?php endif; ?>
 

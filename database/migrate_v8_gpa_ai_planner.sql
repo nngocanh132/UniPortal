@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS GPAPlanSimulation (
     improvement_credits  SMALLINT UNSIGNED NOT NULL DEFAULT 0,
     retakes_json         JSON DEFAULT NULL,
     expected_gpa         DECIMAL(3,2) DEFAULT NULL,
-    required_future_gpa  DECIMAL(4,3) DEFAULT NULL,
+    required_future_gpa  DECIMAL(7,3) DEFAULT NULL,
     feasibility          VARCHAR(20) NOT NULL DEFAULT 'achievable',
     created_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (simulation_id),
@@ -63,4 +63,4 @@ CREATE TABLE IF NOT EXISTS GPAPlanSimulation (
         REFERENCES Student (student_id) ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT ck_gpa_sim_target CHECK (target_gpa BETWEEN 0 AND 4),
     CONSTRAINT ck_gpa_sim_future CHECK (future_gpa BETWEEN 0 AND 4)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

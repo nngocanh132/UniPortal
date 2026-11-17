@@ -287,7 +287,7 @@ $creditPct = $profile['required_credits'] > 0
 $gpaPct = $profile['current_gpa'] !== null ? min(100, $profile['current_gpa'] / 4 * 100) : 0;
 $targetPct = min(100, $targetGpa / 4 * 100);
 
-$pageTitle  = 'GPA Planner & AI Advisor';
+$pageTitle  = 'Kế hoạch & Dự báo GPA (AI)';
 $activePage = 'gpa-forecast';
 $imgBase    = '../../assets/img/';
 $assetBase  = '../../assets/';

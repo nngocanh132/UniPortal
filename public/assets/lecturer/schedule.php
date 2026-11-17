@@ -182,6 +182,9 @@ require __DIR__ . '/_layout.php';
                 <?= substr($scheduleInfo['start_time'], 0, 5) ?>–<?= substr($scheduleInfo['end_time'], 0, 5) ?>
                 <?= $scheduleInfo['room'] ? ' • 📍 ' . h($scheduleInfo['room']) : '' ?>
                 • Hiệu lực <?= date('d/m/Y', strtotime($scheduleInfo['effective_start'])) ?>–<?= date('d/m/Y', strtotime($scheduleInfo['effective_end'])) ?>
+                <?php if (!empty($scheduleInfo['expected_sessions'])): ?>
+                • Số buổi dự kiến: <?= (int)$scheduleInfo['expected_sessions'] ?>
+                <?php endif; ?>
             </div>
         </div>
         <span class="lpill lpill--green"><?= $scheduleInfo['status'] === 'Active' ? 'Đang áp dụng' : 'Tạm dừng' ?></span>
@@ -231,13 +234,16 @@ foreach ($groups as [$gTitle, $rows]):
                 $canMakeup   = (int)$sess['pending_makeup'] === 0
                                && ($isCancelled || (int)$sess['approved_cancel'] > 0 || (int)$sess['pending_cancel'] > 0);
                 $label = $sess['course_code'] . ' – ' . $sess['section_code'] . ' • ' .
+                         ($sess['session_no'] !== null ? 'Buổi ' . (int)$sess['session_no'] . ' • ' : 'Học bù • ') .
                          date('d/m/Y', strtotime($sess['session_date'])) . ' ' .
                          substr($sess['start_time'], 0, 5) . '–' . substr($sess['end_time'], 0, 5);
             ?>
                 <tr style="<?= $isCancelled ? 'background:#fff5f5;' : ($sess['session_date'] === $today ? 'background:#eff4ff;' : '') ?>">
                     <td>
                         <div style="font-weight:700;color:<?= $isCancelled ? '#b91c1c' : '#001634' ?>;"><?= date('d/m/Y', strtotime($sess['session_date'])) ?></div>
-                        <div style="font-size:11px;color:#94a3b8;"><?= ts_day_label($sess['session_date']) ?><?= $sess['session_date'] === $today ? ' • HÔM NAY' : '' ?></div>
+                        <div style="font-size:11px;color:#94a3b8;">
+                            <?= $sess['session_no'] !== null ? 'Buổi ' . (int)$sess['session_no'] . ' • ' : ($sess['session_type'] === 'Makeup' ? 'Học bù • ' : '') ?><?= ts_day_label($sess['session_date']) ?><?= $sess['session_date'] === $today ? ' • HÔM NAY' : '' ?>
+                        </div>
                     </td>
                     <td style="font-size:13px;font-weight:600;"><?= substr($sess['start_time'], 0, 5) ?> – <?= substr($sess['end_time'], 0, 5) ?></td>
                     <td>

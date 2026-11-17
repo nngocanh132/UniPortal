@@ -10,6 +10,8 @@ require_once $root . '/src/src/helpers/auth.php';
 require_once $root . '/src/src/models/Lecturer.php';
 require_once $root . '/src/src/services/NotificationService.php';
 require_once $root . '/src/src/services/AcademicAlertService.php';
+require_once $root . '/src/src/services/UploadService.php';
+require_once $root . '/src/src/services/AssignmentService.php';
 
 require_lecturer();
 if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
@@ -23,11 +25,34 @@ $semId      = (int)($currentSem['semester_id'] ?? 0);
 $sections   = $semId ? LecturerModel::getSections($lecId, $semId) : [];
 $warnCount  = LecturerModel::getUnreadWarningCount($lecId);
 
-// Storage path for assignment attachments
-$storageBase = $root . '/storage/uploads/assignments';
-if (!is_dir($storageBase)) mkdir($storageBase, 0755, true);
-
 $flash = '';
+
+// Keep form validation identical for creation and editing, including stale forms.
+function assignmentInput(string $key, string $default = ''): string {
+    if (!array_key_exists($key, $_POST)) return $default;
+    if (!is_string($_POST[$key])) throw new InvalidArgumentException('Dữ liệu biểu mẫu không hợp lệ.');
+    return trim($_POST[$key]);
+}
+
+function assignmentDate(string $value, string $label, bool $optional = false): ?string {
+    if ($value === '' && $optional) return null;
+    if (!preg_match('/\A(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?\z/', $value, $parts)
+        || (int)$parts[1] < 1000
+        || !checkdate((int)$parts[2], (int)$parts[3], (int)$parts[1])
+        || (int)$parts[4] > 23 || (int)$parts[5] > 59 || (int)($parts[6] ?? 0) > 59) {
+        throw new InvalidArgumentException($label . ' không hợp lệ.');
+    }
+    return $parts[1] . '-' . $parts[2] . '-' . $parts[3] . ' ' . $parts[4] . ':' . $parts[5] . ':' . ($parts[6] ?? '00');
+}
+
+function assignmentMaxScore(string $value): string {
+    if (!preg_match('/\A(?:\d+(?:\.\d{1,2})?|\.\d{1,2})\z/', $value)
+        || !is_numeric($value) || !is_finite((float)$value)
+        || (float)$value < 0.01 || (float)$value > 999.99) {
+        throw new InvalidArgumentException('Điểm tối đa phải từ 0.01 đến 999.99, với tối đa 2 chữ số thập phân.');
+    }
+    return number_format((float)$value, 2, '.', '');
+}
 
 // ── Helper: verify lecturer owns the section ──────────────────
 function lecOwnsSection(int $lecId, int $sectionId, array $sections): bool {
@@ -42,172 +67,131 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     csrf_verify();
     $action = $_POST['_action'] ?? '';
 
-    if ($action === 'create_assignment') {
-        $sectionId  = (int)($_POST['section_id'] ?? 0);
-        $title      = trim($_POST['title']       ?? '');
-        $desc       = trim($_POST['description'] ?? '');
-        $instruct   = trim($_POST['instructions'] ?? '');
-        $pubDate    = trim($_POST['publication_date'] ?? '');
-        $due        = trim($_POST['due_date']    ?? '');
-        $maxScore   = (float)($_POST['max_score'] ?? 10);
-        $status     = in_array($_POST['status'] ?? '', ['Draft','Published','Closed'], true) ? $_POST['status'] : 'Published';
-
-        if (!lecOwnsSection($lecId, $sectionId, $sections)) {
-            $flash = 'error:Không có quyền tạo bài tập cho lớp này.';
-        } elseif ($title === '') {
-            $flash = 'error:Tiêu đề bài tập không được để trống.';
-        } elseif (!$due || strtotime($due) === false) {
-            $flash = 'error:Hạn nộp không hợp lệ.';
-        } elseif ($maxScore <= 0) {
-            $flash = 'error:Điểm tối đa phải lớn hơn 0.';
-        } elseif ($status === 'Closed') {
-            $flash = 'error:Không thể tạo bài tập ở trạng thái Đã đóng.';
-        } else {
-            $attPath = $attName = $attSize = $attMime = null;
-
-            // Handle multiple attachments
-            $uploadedAttachments = [];
-            if (isset($_FILES['attachments']) && !empty($_FILES['attachments']['name'][0])) {
-                $files = $_FILES['attachments'];
-                $allowed = ['pdf','doc','docx','ppt','pptx','xls','xlsx','zip','jpg','jpeg','png','txt'];
-                $fileCount = count($files['name']);
-                for ($i = 0; $i < $fileCount; $i++) {
-                    if ($files['error'][$i] !== UPLOAD_ERR_OK) continue;
-                    $ext = strtolower(pathinfo($files['name'][$i], PATHINFO_EXTENSION));
-                    if (!in_array($ext, $allowed)) {
-                        $flash = 'error:Định dạng file "' . $files['name'][$i] . '" không hợp lệ.';
-                        break;
-                    } elseif ($files['size'][$i] > 20 * 1024 * 1024) {
-                        $flash = 'error:File "' . $files['name'][$i] . '" quá lớn (tối đa 20 MB).';
-                        break;
-                    } else {
-                        $dir = $storageBase . '/' . $sectionId;
-                        if (!is_dir($dir)) mkdir($dir, 0755, true);
-                        $safeName = bin2hex(random_bytes(8)) . '.' . $ext;
-                        if (move_uploaded_file($files['tmp_name'][$i], $dir . '/' . $safeName)) {
-                            $uploadedAttachments[] = [
-                                'path' => 'assignments/' . $sectionId . '/' . $safeName,
-                                'name' => $files['name'][$i],
-                                'size' => $files['size'][$i],
-                                'mime' => $files['type'][$i],
-                            ];
-                        }
-                    }
+    if (in_array($action, ['create_assignment', 'edit_assignment'], true)) {
+        $creating = $action === 'create_assignment';
+        $savedAttachments = [];
+        try {
+            $pdo->beginTransaction();
+            $current = [];
+            if ($creating) {
+                $sectionId = (int)assignmentInput('section_id');
+                if (!lecOwnsSection($lecId, $sectionId, $sections)) {
+                    throw new InvalidArgumentException('Không có quyền tạo bài tập cho lớp này.');
                 }
+                // Recheck ownership under a lock in case the section was reassigned.
+                $ownerCheck = $pdo->prepare(
+                    'SELECT section_id FROM ClassSection
+                     WHERE section_id=:sid AND lecturer_id=:lid LIMIT 1 FOR UPDATE'
+                );
+                $ownerCheck->execute([':sid' => $sectionId, ':lid' => $lecId]);
+                if (!$ownerCheck->fetch()) {
+                    throw new InvalidArgumentException('Không có quyền tạo bài tập cho lớp này.');
+                }
+            } else {
+                $asgId = (int)assignmentInput('assignment_id');
+                $ownerCheck = $pdo->prepare(
+                    'SELECT a.* FROM Assignment a
+                     JOIN ClassSection cs ON cs.section_id=a.section_id
+                     WHERE a.assignment_id=:aid AND cs.lecturer_id=:lid AND a.is_deleted=0 LIMIT 1 FOR UPDATE'
+                );
+                $ownerCheck->execute([':aid' => $asgId, ':lid' => $lecId]);
+                $current = $ownerCheck->fetch();
+                if (!$current) {
+                    throw new InvalidArgumentException('Không có quyền chỉnh sửa bài tập này.');
+                }
+                $sectionId = (int)$current['section_id'];
             }
-            // Legacy single-file support
-            if (empty($uploadedAttachments) && isset($_FILES['attachment']) && $_FILES['attachment']['error'] === UPLOAD_ERR_OK) {
-                $f       = $_FILES['attachment'];
-                $allowed = ['pdf','doc','docx','ppt','pptx','xls','xlsx','zip','jpg','jpeg','png','txt'];
-                $ext     = strtolower(pathinfo($f['name'], PATHINFO_EXTENSION));
-                if (!in_array($ext, $allowed)) {
-                    $flash = 'error:Định dạng file đính kèm không hợp lệ.';
-                } elseif ($f['size'] > 20 * 1024 * 1024) {
-                    $flash = 'error:File đính kèm tối đa 20 MB.';
-                } else {
-                    $dir = $storageBase . '/' . $sectionId;
-                    if (!is_dir($dir)) mkdir($dir, 0755, true);
-                    $safeName = bin2hex(random_bytes(8)) . '.' . $ext;
-                    if (move_uploaded_file($f['tmp_name'], $dir . '/' . $safeName)) {
-                        $attPath = 'assignments/' . $sectionId . '/' . $safeName;
-                        $attName = $f['name'];
-                        $attSize = $f['size'];
-                        $attMime = $f['type'];
-                        $uploadedAttachments[] = [
-                            'path' => $attPath, 'name' => $attName,
-                            'size' => $attSize, 'mime' => $attMime,
-                        ];
+
+            $title = assignmentInput('title');
+            if ($title === '' || mb_strlen($title, 'UTF-8') > 200) {
+                throw new InvalidArgumentException('Tiêu đề bài tập phải từ 1 đến 200 ký tự.');
+            }
+            $desc = assignmentInput('description', (string)($current['description'] ?? ''));
+            $instruct = assignmentInput('instructions', (string)($current['instructions'] ?? ''));
+            $pubDate = assignmentDate(assignmentInput('publication_date', (string)($current['publication_date'] ?? '')), 'Ngày công bố', true);
+            $due = assignmentDate(assignmentInput('due_date'), 'Hạn nộp');
+            $maxScore = assignmentMaxScore(assignmentInput('max_score'));
+            if ($pubDate !== null && $pubDate > $due) {
+                throw new InvalidArgumentException('Ngày công bố không được sau hạn nộp.');
+            }
+            $allowResubmission = assignmentInput('allow_resubmission', (string)($current['allow_resubmission'] ?? 1));
+            if (!in_array($allowResubmission, ['0', '1'], true)) {
+                throw new InvalidArgumentException('Chính sách nộp lại không hợp lệ.');
+            }
+            $status = $creating ? assignmentInput('status', 'Published') : $current['status'];
+            if ($creating && !in_array($status, ['Draft', 'Published'], true)) {
+                throw new InvalidArgumentException('Bài tập mới phải ở trạng thái Nháp hoặc Công bố.');
+            }
+            if (!$creating) {
+                // Lock existing scores as well as the assignment while changing its scale.
+                $scores = $pdo->prepare('SELECT score FROM Submission WHERE assignment_id=:aid AND score IS NOT NULL FOR UPDATE');
+                $scores->execute([':aid' => $asgId]);
+                foreach ($scores->fetchAll(PDO::FETCH_COLUMN) as $score) {
+                    if ((float)$score > (float)$maxScore) {
+                        throw new InvalidArgumentException('Điểm tối đa không được thấp hơn điểm bài nộp đã chấm (' . $score . ').');
                     }
                 }
             }
 
-            if (!$flash) {
+            try {
+                $savedAttachments = UploadService::store($_FILES['attachments'] ?? [], 'assignments/' . $sectionId, false);
+            } catch (RuntimeException $uploadError) {
+                throw new InvalidArgumentException($uploadError->getMessage(), 0, $uploadError);
+            }
+            $params = [
+                ':title' => $title, ':desc' => $desc !== '' ? $desc : null,
+                ':inst' => $instruct !== '' ? $instruct : null, ':pub' => $pubDate,
+                ':due' => $due, ':ms' => $maxScore, ':resub' => (int)$allowResubmission,
+            ];
+            if ($creating) {
                 $pdo->prepare(
                     'INSERT INTO Assignment
                         (section_id, title, description, instructions, publication_date,
-                         attachment_path, attachment_name,
-                         attachment_size, attachment_mime, due_date, max_score, status, is_deleted, created_by)
-                     VALUES
-                        (:sec, :title, :desc, :inst, :pub,
-                         :ap, :an, :as_, :am, :due, :ms, :st, 0, :by)'
-                )->execute([
-                    ':sec'   => $sectionId, ':title' => $title,
-                    ':desc'  => $desc ?: null, ':inst' => $instruct ?: null,
-                    ':pub'   => $pubDate ? date('Y-m-d H:i:s', strtotime($pubDate)) : null,
-                    ':ap' => $attPath, ':an' => $attName,
-                    ':as_'   => $attSize, ':am' => $attMime,
-                    ':due'   => date('Y-m-d H:i:s', strtotime($due)),
-                    ':ms'    => $maxScore, ':st' => $status, ':by' => $accountId,
-                ]);
-                $newId = (int)$pdo->lastInsertId();
-
-                // Insert all attachment files into AssignmentAttachment table
-                foreach ($uploadedAttachments as $ua) {
-                    $pdo->prepare(
-                        'INSERT INTO AssignmentAttachment (assignment_id, file_path, file_name, file_size, file_mime)
-                         VALUES (:aid, :fp, :fn, :fs, :fm)'
-                    )->execute([
-                        ':aid' => $newId, ':fp' => $ua['path'],
-                        ':fn'  => $ua['name'], ':fs' => $ua['size'], ':fm' => $ua['mime'],
-                    ]);
-                }
-
-                // Notify enrolled students only when the assignment is visible
-                if ($status === 'Published') {
-                    $enrolled = $pdo->prepare(
-                        'SELECT a.account_id FROM Enrollment e
-                         JOIN Account a ON a.student_id=e.student_id
-                         WHERE e.section_id=:sid AND e.status IN (\'Enrolled\',\'Completed\')'
-                    );
-                    $enrolled->execute([':sid' => $sectionId]);
-                    foreach ($enrolled->fetchAll() as $row) {
-                        NotificationService::send(
-                            (int)$row['account_id'], 'Assignment',
-                            '📋 Bài tập mới: ' . $title,
-                            'Hạn nộp: ' . date('d/m/Y H:i', strtotime($due)),
-                            '/UniPortal/public/assets/student/assignments.php'
-                        );
-                    }
-                }
-
-                AcademicAlertService::writeAuditLog(
-                    $pdo, $accountId, 'CREATE_ASSIGNMENT', 'Assignment', (string)$newId,
-                    null, json_encode(['title' => $title, 'section_id' => $sectionId, 'status' => $status])
-                );
-                $flash = 'success:Đã tạo bài tập "' . $title . '" (' . ($status === 'Draft' ? 'bản nháp' : 'đã công bố') . ').';
+                         due_date, max_score, allow_resubmission, status, is_deleted, created_by)
+                     VALUES (:sec, :title, :desc, :inst, :pub, :due, :ms, :resub, :st, 0, :by)'
+                )->execute($params + [':sec' => $sectionId, ':st' => $status, ':by' => $accountId]);
+                $asgId = (int)$pdo->lastInsertId();
+            } else {
+                $pdo->prepare(
+                    'UPDATE Assignment SET title=:title, description=:desc, instructions=:inst,
+                            publication_date=:pub, due_date=:due, max_score=:ms,
+                            allow_resubmission=:resub, updated_at=NOW()
+                     WHERE assignment_id=:aid'
+                )->execute($params + [':aid' => $asgId]);
             }
+            foreach ($savedAttachments as $attachment) {
+                $pdo->prepare(
+                    'INSERT INTO AssignmentAttachment (assignment_id, file_path, file_name, file_size, file_mime)
+                     VALUES (:aid, :fp, :fn, :fs, :fm)'
+                )->execute([
+                    ':aid' => $asgId, ':fp' => $attachment['path'], ':fn' => $attachment['name'],
+                    ':fs' => $attachment['size'], ':fm' => $attachment['mime'],
+                ]);
+            }
+
+            // Notifications share the transaction, so a rollback cannot announce a failed create.
+            if ($creating && $status === 'Published' && ($pubDate === null || $pubDate <= date('Y-m-d H:i:s'))) {
+                NotificationService::notifyAssignmentPublished($pdo, $asgId, $sectionId, $title, $due);
+            }
+            AcademicAlertService::writeAuditLog(
+                $pdo, $accountId, $creating ? 'CREATE_ASSIGNMENT' : 'EDIT_ASSIGNMENT', 'Assignment', (string)$asgId,
+                null, json_encode(['title' => $title, 'section_id' => $sectionId, 'status' => $status, 'allow_resubmission' => (int)$allowResubmission])
+            );
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            UploadService::cleanup($savedAttachments);
+            error_log('Assignment save failed: ' . $e->getMessage());
+            $flash = 'error:' . ($e instanceof InvalidArgumentException
+                ? $e->getMessage() : 'Không thể lưu bài tập hoặc tài liệu đính kèm. Vui lòng kiểm tra file và thử lại.');
         }
-    }
-
-    if ($action === 'edit_assignment') {
-        $asgId    = (int)($_POST['assignment_id'] ?? 0);
-        $title    = trim($_POST['title']          ?? '');
-        $desc     = trim($_POST['description']    ?? '');
-        $due      = trim($_POST['due_date']       ?? '');
-        $maxScore = (float)($_POST['max_score']   ?? 10);
-
-        // Verify ownership via section
-        $ownerCheck = $pdo->prepare(
-            'SELECT a.section_id FROM Assignment a
-             JOIN ClassSection cs ON cs.section_id=a.section_id
-             WHERE a.assignment_id=:aid AND cs.lecturer_id=:lid AND a.is_deleted=0 LIMIT 1'
-        );
-        $ownerCheck->execute([':aid' => $asgId, ':lid' => $lecId]);
-        if (!$ownerCheck->fetch()) {
-            $flash = 'error:Không có quyền chỉnh sửa bài tập này.';
-        } elseif ($title === '' || !$due || $maxScore <= 0) {
-            $flash = 'error:Vui lòng điền đầy đủ thông tin hợp lệ.';
-        } else {
-            $pdo->prepare(
-                'UPDATE Assignment SET title=:title, description=:desc, due_date=:due,
-                        max_score=:ms, updated_at=NOW()
-                 WHERE assignment_id=:aid'
-            )->execute([
-                ':title' => $title, ':desc' => $desc ?: null,
-                ':due'   => date('Y-m-d H:i:s', strtotime($due)),
-                ':ms'    => $maxScore, ':aid' => $asgId,
-            ]);
-            $flash = 'success:Đã cập nhật bài tập.';
+        if ($flash === '') {
+            $flash = $creating ? 'success:Đã tạo bài tập "' . $title . '".' : 'success:Đã cập nhật bài tập.';
+            if ($creating) {
+                $_SESSION['_flash'] = $flash;
+                header('Location: assignment_detail.php?id=' . $asgId);
+                exit;
+            }
         }
     }
 
@@ -245,8 +229,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $flash = 'error:Trạng thái không hợp lệ.';
         } else {
             $own = $pdo->prepare(
-                'SELECT a.assignment_id, a.status, a.title,
-                        (SELECT COUNT(*) FROM Submission sub WHERE sub.assignment_id=a.assignment_id) AS sub_count
+                'SELECT a.assignment_id, a.section_id, a.status, a.title, a.due_date, a.publication_date,
+                        (SELECT COUNT(*) FROM Submission sub WHERE sub.assignment_id=a.assignment_id AND sub.submitted_at IS NOT NULL) AS sub_count
                  FROM Assignment a
                  JOIN ClassSection cs ON cs.section_id=a.section_id
                  WHERE a.assignment_id=:aid AND cs.lecturer_id=:lid AND a.is_deleted=0 LIMIT 1'
@@ -258,121 +242,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } elseif ($newStatus === 'Draft' && (int)$asgRow['sub_count'] > 0) {
                 $flash = 'error:Không thể chuyển về nháp vì đã có bài nộp.';
             } else {
-                $pdo->prepare(
-                    'UPDATE Assignment SET status=:st,
-                        publication_date = IF(:st2=\'Published\' AND publication_date IS NULL, NOW(), publication_date),
-                        updated_at=NOW()
-                     WHERE assignment_id=:aid'
-                )->execute([':st' => $newStatus, ':st2' => $newStatus, ':aid' => $asgId]);
-                AcademicAlertService::writeAuditLog(
-                    $pdo, $accountId, 'ASSIGNMENT_STATUS', 'Assignment', (string)$asgId,
-                    json_encode(['status' => $asgRow['status']]), json_encode(['status' => $newStatus])
-                );
-                $labels = ['Draft'=>'nháp','Published'=>'công bố','Closed'=>'đóng'];
-                $flash = 'success:Đã chuyển bài tập "'.$asgRow['title'].'" sang trạng thái '.$labels[$newStatus].'.';
+                // Status change and announcements must succeed or fail together.
+                $pdo->beginTransaction();
+                try {
+                    $pdo->prepare(
+                        'UPDATE Assignment SET status=:st,
+                            publication_date = IF(:st2=\'Published\' AND publication_date IS NULL, NOW(), publication_date),
+                            updated_at=NOW()
+                         WHERE assignment_id=:aid'
+                    )->execute([':st' => $newStatus, ':st2' => $newStatus, ':aid' => $asgId]);
+                    // Skip future-dated publications: students cannot open the assignment yet.
+                    if ($newStatus === 'Published'
+                        && $asgRow['status'] !== 'Published'
+                        && ($asgRow['publication_date'] === null || $asgRow['publication_date'] <= date('Y-m-d H:i:s'))) {
+                        NotificationService::notifyAssignmentPublished(
+                            $pdo, $asgId, (int)$asgRow['section_id'], (string)$asgRow['title'], (string)$asgRow['due_date']
+                        );
+                    }
+                    AcademicAlertService::writeAuditLog(
+                        $pdo, $accountId, 'ASSIGNMENT_STATUS', 'Assignment', (string)$asgId,
+                        json_encode(['status' => $asgRow['status']]), json_encode(['status' => $newStatus])
+                    );
+                    $pdo->commit();
+                } catch (Throwable $e) {
+                    if ($pdo->inTransaction()) $pdo->rollBack();
+                    error_log('Assignment status change failed: ' . $e->getMessage());
+                    $flash = 'error:Không thể cập nhật trạng thái bài tập. Vui lòng thử lại.';
+                }
+                if ($flash === '') {
+                    $labels = ['Draft'=>'nháp','Published'=>'công bố','Closed'=>'đóng'];
+                    $flash = 'success:Đã chuyển bài tập "'.$asgRow['title'].'" sang trạng thái '.$labels[$newStatus].'.';
+                }
             }
         }
     }
 
     if ($action === 'grade_submission') {
-        $submissionId = (int)($_POST['submission_id'] ?? 0);
-        $score        = trim($_POST['score']          ?? '');
-        $feedback     = trim($_POST['feedback']       ?? '');
-        $publish      = isset($_POST['publish']);
-
-        // Verify ownership and load the current grade for the history diff
-        $sub = $pdo->prepare(
-            'SELECT sub.submission_id, sub.assignment_id, sub.enrollment_id,
-                    sub.score, sub.feedback, sub.grade_status,
-                    a.max_score, cs.lecturer_id
-             FROM Submission sub
-             JOIN Assignment a ON a.assignment_id=sub.assignment_id
-             JOIN ClassSection cs ON cs.section_id=a.section_id
-             WHERE sub.submission_id=:sid AND cs.lecturer_id=:lid LIMIT 1'
-        );
-        $sub->execute([':sid' => $submissionId, ':lid' => $lecId]);
-        $subRow = $sub->fetch();
-
-        if (!$subRow) {
-            $flash = 'error:Không tìm thấy bài nộp hoặc không có quyền chấm.';
-        } elseif ($score !== '' && ((float)$score < 0 || (float)$score > (float)$subRow['max_score'])) {
-            $flash = 'error:Điểm phải từ 0 đến ' . number_format((float)$subRow['max_score'], 0) . '.';
-        } else {
-            $gradeStatus = $publish ? 'Published' : 'Draft';
-            $oldScore    = $subRow['score'] !== null ? (float)$subRow['score'] : null;
-            $newScore    = $score !== '' ? (float)$score : null;
-            $oldFeedback = trim((string)($subRow['feedback'] ?? ''));
-            $newFeedback = trim($feedback);
-            $gradeChanged = $oldScore !== $newScore
-                || $oldFeedback !== $newFeedback
-                || $subRow['grade_status'] !== $gradeStatus;
-
-            try {
-                $pdo->beginTransaction();
-
-                $pdo->prepare(
-                    'UPDATE Submission SET score=:score, feedback=:fb, grade_status=:gs
-                     WHERE submission_id=:sid'
-                )->execute([
-                    ':score' => $newScore,
-                    ':fb'    => $newFeedback !== '' ? $newFeedback : null,
-                    ':gs'    => $gradeStatus,
-                    ':sid'   => $submissionId,
-                ]);
-
-                // Keep an immutable trail of every grade/feedback change.
-                if ($gradeChanged) {
-                    $pdo->prepare(
-                        'INSERT INTO SubmissionGradeHistory
-                            (submission_id, old_score, new_score, old_feedback, new_feedback,
-                             old_grade_status, new_grade_status, changed_by, changed_at)
-                         VALUES (:sid, :os, :ns, :ofb, :nfb, :ogs, :ngs, :by, NOW())'
-                    )->execute([
-                        ':sid' => $submissionId,
-                        ':os'  => $oldScore,
-                        ':ns'  => $newScore,
-                        ':ofb' => $oldFeedback !== '' ? $oldFeedback : null,
-                        ':nfb' => $newFeedback !== '' ? $newFeedback : null,
-                        ':ogs' => $subRow['grade_status'],
-                        ':ngs' => $gradeStatus,
-                        ':by'  => $accountId ?: null,
-                    ]);
-                    AcademicAlertService::writeAuditLog(
-                        $pdo, $accountId, 'GRADE_SUBMISSION', 'Submission', (string)$submissionId,
-                        json_encode(['score' => $oldScore, 'grade_status' => $subRow['grade_status']]),
-                        json_encode(['score' => $newScore, 'grade_status' => $gradeStatus])
-                    );
-                }
-
-                $pdo->commit();
-            } catch (Throwable $e) {
-                if ($pdo->inTransaction()) $pdo->rollBack();
-                $flash = 'error:Không thể lưu điểm. Vui lòng thử lại.';
+        // Old bookmarked forms must not bypass the shared, version-aware grading path.
+        try {
+            $submissionId = filter_var(assignmentInput('submission_id'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            $version = filter_var(assignmentInput('version'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            $revision = filter_var(assignmentInput('revision'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
+            if ($submissionId === false || $version === false || $revision === false) {
+                throw new InvalidArgumentException('Biểu mẫu chấm điểm đã cũ. Vui lòng mở lại trang chi tiết bài nộp.');
             }
-
-            if (!$flash) {
-                if ($publish && $newScore !== null) {
-                    // Notify student
-                    $stu = $pdo->prepare(
-                        'SELECT a.account_id FROM Enrollment e
-                         JOIN Account a ON a.student_id=e.student_id
-                         WHERE e.enrollment_id=:eid LIMIT 1'
-                    );
-                    $stu->execute([':eid' => $subRow['enrollment_id']]);
-                    $stuAcc = (int)($stu->fetchColumn() ?? 0);
-                    if ($stuAcc) {
-                        NotificationService::send(
-                            $stuAcc, 'Grade',
-                            '📊 Bài tập đã được chấm điểm',
-                            'Điểm: ' . number_format($newScore, 1) . '/' . number_format((float)$subRow['max_score'], 1),
-                            '/UniPortal/public/assets/student/assignments.php'
-                        );
-                    }
-                    // Trigger GPA recalc check
-                    AcademicAlertService::afterGradeSave((int)$subRow['enrollment_id']);
-                }
-                $flash = 'success:Đã lưu điểm' . ($publish ? ' và công bố cho sinh viên.' : ' (bản nháp).');
-            }
+            $result = AssignmentService::grade(
+                $submissionId, $lecId, $accountId, assignmentInput('score'), assignmentInput('feedback'),
+                isset($_POST['publish']), $version, $revision
+            );
+            $flash = ($result['ok'] ? 'success:' : 'error:') . $result['message'];
+        } catch (Throwable $e) {
+            $flash = 'error:' . ($e instanceof InvalidArgumentException
+                ? $e->getMessage() : 'Không thể lưu điểm. Vui lòng mở lại trang chi tiết bài nộp.');
         }
     }
 
@@ -413,8 +334,8 @@ $assignments = [];
 if ($selSection) {
     $asgSt = $pdo->prepare(
         'SELECT a.*,
-                (SELECT COUNT(*) FROM Submission sub WHERE sub.assignment_id=a.assignment_id) AS sub_count,
-                (SELECT COUNT(*) FROM Submission sub WHERE sub.assignment_id=a.assignment_id AND sub.score IS NOT NULL) AS graded_count,
+                (SELECT COUNT(*) FROM Submission sub WHERE sub.assignment_id=a.assignment_id AND sub.submitted_at IS NOT NULL) AS sub_count,
+                (SELECT COUNT(*) FROM Submission sub WHERE sub.assignment_id=a.assignment_id AND sub.submitted_at IS NOT NULL AND sub.score IS NOT NULL) AS graded_count,
                 (SELECT COUNT(*) FROM Enrollment e WHERE e.section_id=a.section_id AND e.status IN (\'Enrolled\',\'Completed\')) AS enrolled_count
          FROM Assignment a
          WHERE a.section_id=:sid AND a.is_deleted=0'
@@ -445,6 +366,7 @@ if ($selSection) {
 
 // ── Load submissions for selected assignment ──────────────────
 $submissions  = [];
+$submissionAttachments = [];
 $gradeHistory = [];
 $selAsgInfo   = null;
 if ($selAsg && $tab === 'submissions') {
@@ -469,19 +391,30 @@ if ($selAsg && $tab === 'submissions') {
         );
         $subSt->execute([':aid' => $selAsg, ':sid' => $selAsgInfo['section_id']]);
         $submissions = $subSt->fetchAll();
+        $subAtt = $pdo->prepare(
+            'SELECT sa.submission_id, sa.sub_attachment_id, sa.file_name, sa.file_size
+             FROM SubmissionAttachment sa
+             JOIN Submission sub ON sub.submission_id=sa.submission_id AND sa.version=sub.version
+             WHERE sub.assignment_id=:aid ORDER BY sa.sub_attachment_id'
+        );
+        $subAtt->execute([':aid' => $selAsg]);
+        foreach ($subAtt->fetchAll() as $attachment) {
+            $submissionAttachments[(int)$attachment['submission_id']][] = $attachment;
+        }
 
         $subCounters = ['submitted'=>0,'missing'=>0,'late'=>0,'graded'=>0,'ungraded'=>0];
         foreach ($submissions as $sRow) {
-            $hasF = !empty($sRow['file_path']);
-            $late = $hasF && $sRow['submitted_at'] && strtotime($sRow['submitted_at']) > strtotime($selAsgInfo['due_date']);
+            $hasF = !empty($sRow['submission_id']) && !empty($sRow['submitted_at']);
+            $late = $hasF && strtotime($sRow['submitted_at']) > strtotime($selAsgInfo['due_date']);
             if ($hasF) $subCounters['submitted']++; else $subCounters['missing']++;
             if ($late) $subCounters['late']++;
-            if ($hasF && $sRow['score'] !== null) $subCounters['graded']++; else $subCounters['ungraded']++;
+            if ($hasF && $sRow['score'] !== null) $subCounters['graded']++;
+            if ($hasF && $sRow['score'] === null) $subCounters['ungraded']++;
         }
         if ($sf !== '') {
             $submissions = array_values(array_filter($submissions, function ($sRow) use ($sf, $selAsgInfo) {
-                $hasF = !empty($sRow['file_path']);
-                $late = $hasF && $sRow['submitted_at'] && strtotime($sRow['submitted_at']) > strtotime($selAsgInfo['due_date']);
+                $hasF = !empty($sRow['submission_id']) && !empty($sRow['submitted_at']);
+                $late = $hasF && strtotime($sRow['submitted_at']) > strtotime($selAsgInfo['due_date']);
                 return match ($sf) {
                     'submitted' => $hasF,
                     'missing'   => !$hasF,
@@ -662,7 +595,8 @@ if ($tab === 'manage'):
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;">
             <div style="flex:1;">
                 <div style="font-size:16px;font-weight:700;color:#001634;margin-bottom:4px;">
-                    <?= h($asg['title']) ?>
+                    <a href="assignment_detail.php?asg=<?= (int)$asg['assignment_id'] ?>"
+                       style="color:inherit;text-decoration:none;"><?= h($asg['title']) ?></a>
                     <span class="lpill <?= $stCls ?>" style="font-size:10px;margin-left:6px;"><?= $stLbl ?></span>
                 </div>
                 <?php if ($asg['description']): ?>
@@ -670,7 +604,7 @@ if ($tab === 'manage'):
                 <?php endif; ?>
                 <div style="display:flex;gap:16px;font-size:12px;color:#64748b;flex-wrap:wrap;">
                     <span>📅 Hạn: <strong style="color:<?= $isOverdue?'#ef4444':'#334155' ?>"><?= fmt_dt($asg['due_date']) ?></strong></span>
-                    <span>📊 Max: <?= number_format((float)$asg['max_score'], 0) ?> điểm</span>
+                    <span>📊 Max: <?= number_format((float)$asg['max_score'], 2) ?> điểm</span>
                     <?php if ($asg['attachment_name']): ?>
                     <span>📎 <?= h($asg['attachment_name']) ?> (<?= fmt_size((int)$asg['attachment_size']) ?>)</span>
                     <?php endif; ?>
@@ -678,7 +612,7 @@ if ($tab === 'manage'):
                     $atts = $asgAttachments[$asg['assignment_id']] ?? [];
                     foreach ($atts as $att):
                     ?>
-                    <span>📎 <a href="../download.php?type=assignment_attachment&id=<?= (int)$att['attachment_id'] ?>" download style="color:#3b82f6;">
+                    <span>📎 <a href="../../download.php?type=assignment_attachment&id=<?= (int)$att['attachment_id'] ?>" download style="color:#3b82f6;">
                         <?= h($att['file_name']) ?> (<?= fmt_size((int)$att['file_size']) ?>)
                     </a></span>
                     <?php endforeach; ?>
@@ -695,6 +629,8 @@ if ($tab === 'manage'):
             </div>
         </div>
         <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+            <a href="assignment_detail.php?asg=<?= (int)$asg['assignment_id'] ?>"
+               class="lbtn lbtn--outline lbtn--sm">🔎 Chi tiết &amp; thống kê</a>
             <a href="assignments.php?tab=submissions&section=<?= (int)$asg['section_id'] ?>&asg=<?= (int)$asg['assignment_id'] ?>"
                class="lbtn lbtn--primary lbtn--sm">📤 Xem bài nộp & chấm điểm</a>
             <button onclick="openEdit(<?= htmlspecialchars(json_encode($asg), ENT_QUOTES) ?>)"
@@ -726,7 +662,7 @@ if ($tab === 'manage'):
             <?php endif; ?>
             <?php if ((int)$asg['graded_count'] === 0): ?>
             <form method="POST" style="display:inline;"
-                  onsubmit="return confirm('Xóa bài tập \'<?= h(addslashes($asg['title'])) ?>\'?')">
+                  onsubmit="return confirm(<?= h(json_encode('Xóa bài tập "' . $asg['title'] . '"?', JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT)) ?>)">
                 <?= csrf_input() ?>
                 <input type="hidden" name="_action"      value="delete_assignment" />
                 <input type="hidden" name="assignment_id" value="<?= (int)$asg['assignment_id'] ?>" />
@@ -790,10 +726,14 @@ elseif ($tab === 'submissions'):
 
 <!-- Assignment info bar -->
 <div class="lcard" style="padding:14px 20px;background:#eff4ff;border-left:4px solid #3b82f6;">
-    <div style="font-size:15px;font-weight:700;color:#1e40af;"><?= h($selAsgInfo['title']) ?></div>
+    <div style="font-size:15px;font-weight:700;color:#1e40af;">
+        <a href="assignment_detail.php?asg=<?= (int)$selAsgInfo['assignment_id'] ?>" style="color:inherit;text-decoration:none;">
+            <?= h($selAsgInfo['title']) ?> →
+        </a>
+    </div>
     <div style="font-size:12px;color:#3b82f6;margin-top:3px;">
         Hạn nộp: <?= fmt_dt($selAsgInfo['due_date']) ?> •
-        Điểm tối đa: <?= number_format((float)$selAsgInfo['max_score'], 0) ?>
+        Điểm tối đa: <?= number_format((float)$selAsgInfo['max_score'], 2) ?>
     </div>
 </div>
 
@@ -807,7 +747,7 @@ elseif ($tab === 'submissions'):
                     <th>Trạng thái nộp</th>
                     <th>Thời gian nộp</th>
                     <th>File đính kèm</th>
-                    <th>Điểm (/ <?= number_format((float)$selAsgInfo['max_score'], 0) ?>)</th>
+                    <th>Điểm (/ <?= number_format((float)$selAsgInfo['max_score'], 2) ?>)</th>
                     <th>Nhận xét</th>
                     <th>Thao tác</th>
                 </tr>
@@ -819,7 +759,8 @@ elseif ($tab === 'submissions'):
                 </td></tr>
                 <?php else: ?>
                 <?php foreach ($submissions as $sub):
-                    $hasFile = !empty($sub['file_path']);
+                    $hasFile = !empty($sub['submission_id']) && !empty($sub['submitted_at']);
+                    $currentAttachments = $submissionAttachments[(int)($sub['submission_id'] ?? 0)] ?? [];
                     $isLate  = $hasFile && strtotime($sub['submitted_at']) > strtotime($selAsgInfo['due_date']);
                     $ini     = initials($sub['full_name']);
                 ?>
@@ -828,7 +769,15 @@ elseif ($tab === 'submissions'):
                         <div style="display:flex;align-items:center;gap:8px;">
                             <span class="lec-av" style="width:32px;height:32px;"><?= h($ini) ?></span>
                             <div>
-                                <div style="font-weight:700;font-size:13px;color:#001634;"><?= h($sub['full_name']) ?></div>
+                                <div style="font-weight:700;font-size:13px;color:#001634;">
+                                    <?php if ($hasFile): ?>
+                                    <a href="submission_detail.php?sub=<?= (int)$sub['submission_id'] ?>" style="color:inherit;text-decoration:none;">
+                                        <?= h($sub['full_name']) ?>
+                                    </a>
+                                    <?php else: ?>
+                                    <?= h($sub['full_name']) ?>
+                                    <?php endif; ?>
+                                </div>
                                 <div style="font-size:11px;color:#64748b;"><?= h($sub['student_id']) ?> – <?= h($sub['class_code']) ?></div>
                             </div>
                         </div>
@@ -842,8 +791,16 @@ elseif ($tab === 'submissions'):
                     </td>
                     <td style="font-size:12px;color:#64748b;"><?= $sub['submitted_at'] ? fmt_dt($sub['submitted_at']) : '—' ?></td>
                     <td style="font-size:12px;">
-                        <?php if ($hasFile): ?>
-                        <a href="../download.php?type=submission&id=<?= (int)$sub['submission_id'] ?>" download
+                        <?php if ($currentAttachments): ?>
+                        <?php foreach ($currentAttachments as $attachment): ?>
+                        <a href="../../download.php?type=submission_attachment&id=<?= (int)$attachment['sub_attachment_id'] ?>" download
+                           style="color:#3b82f6;display:flex;align-items:center;gap:4px;">
+                            <?= h(mb_strimwidth($attachment['file_name'], 0, 25, '…')) ?>
+                            <span style="font-size:10px;color:#94a3b8;">(<?= fmt_size((int)$attachment['file_size']) ?>)</span>
+                        </a>
+                        <?php endforeach; ?>
+                        <?php elseif (!empty($sub['file_path'])): ?>
+                        <a href="../../download.php?type=submission&id=<?= (int)$sub['submission_id'] ?>" download
                            style="color:#3b82f6;display:flex;align-items:center;gap:4px;">
                             📎 <?= h(mb_strimwidth($sub['file_name'] ?? '', 0, 25, '…')) ?>
                             <span style="font-size:10px;color:#94a3b8;">(<?= fmt_size((int)($sub['file_size'] ?? 0)) ?>)</span>
@@ -855,7 +812,7 @@ elseif ($tab === 'submissions'):
                     <td>
                         <?php if ($sub['score'] !== null): ?>
                         <span style="font-size:18px;font-weight:800;color:<?= (float)$sub['score']/$selAsgInfo['max_score']>=0.5?'#059669':'#ef4444' ?>;">
-                            <?= number_format((float)$sub['score'], 1) ?>
+                            <?= number_format((float)$sub['score'], 2) ?>
                         </span>
                         <?php if ($sub['grade_status'] === 'Published'): ?>
                         <span style="font-size:10px;color:#059669;display:block;">✅ Đã công bố</span>
@@ -871,22 +828,16 @@ elseif ($tab === 'submissions'):
                     </td>
                     <td>
                         <?php if ($hasFile): ?>
-                        <button onclick="openGrade(
-                                    <?= (int)($sub['submission_id'] ?? 0) ?>,
-                                    '<?= h(addslashes($sub['full_name'])) ?>',
-                                    <?= $sub['score'] !== null ? (float)$sub['score'] : 'null' ?>,
-                                    '<?= h(addslashes($sub['feedback'] ?? '')) ?>',
-                                    <?= (float)$selAsgInfo['max_score'] ?>
-                                )"
-                                class="lbtn lbtn--yellow lbtn--sm">
-                            <?= $sub['score'] !== null ? '✏ Sửa điểm' : '✅ Chấm bài' ?>
-                        </button>
+                        <a href="submission_detail.php?sub=<?= (int)$sub['submission_id'] ?>"
+                           class="lbtn lbtn--yellow lbtn--sm">
+                            <?= $sub['score'] !== null ? 'Sửa điểm' : 'Chấm bài' ?>
+                        </a>
                         <?php
                         $histSubId = (int)($sub['submission_id'] ?? 0);
                         if ($histSubId && ($sub['score'] !== null || !empty($gradeHistory[$histSubId]))):
                         ?>
                         <button type="button"
-                                onclick="openHistory(<?= $histSubId ?>, '<?= h(addslashes($sub['full_name'])) ?>')"
+                                onclick="openHistory(<?= $histSubId ?>, <?= h(json_encode($sub['full_name'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT)) ?>)"
                                 class="lbtn lbtn--outline lbtn--sm" style="margin-top:4px;">🕘 Lịch sử</button>
                         <?php endif; ?>
                         <?php else: ?>
@@ -1034,7 +985,7 @@ elseif ($tab === 'assess'):
             </div>
             <div style="grid-column:1/-1;">
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Tiêu đề bài tập *</label>
-                <input type="text" name="title" required maxlength="255"
+                <input type="text" name="title" required maxlength="200"
                        placeholder="VD: Đồ án cuối kỳ – Thiết kế hệ thống"
                        style="width:100%;height:38px;border:1px solid #e2e8f0;border-radius:8px;padding:0 12px;font-size:13px;outline:none;" />
             </div>
@@ -1060,7 +1011,7 @@ elseif ($tab === 'assess'):
             </div>
             <div>
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Điểm tối đa *</label>
-                <input type="number" name="max_score" required min="1" max="100" value="10"
+                <input type="number" name="max_score" required min="0.01" max="999.99" step="0.01" value="10"
                        style="width:100%;height:38px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;outline:none;" />
             </div>
             <div>
@@ -1070,6 +1021,11 @@ elseif ($tab === 'assess'):
                     <option value="Draft">Draft – Bản nháp (ẩn với SV)</option>
                 </select>
             </div>
+            <label style="grid-column:1/-1;display:flex;align-items:center;gap:8px;font-size:13px;color:#334155;cursor:pointer;">
+                <input type="hidden" name="allow_resubmission" value="0" />
+                <input type="checkbox" name="allow_resubmission" value="1" checked />
+                <span>Cho phép sinh viên nộp lại khi bài tập còn mở</span>
+            </label>
             <div style="grid-column:1/-1;">
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">File đề bài đính kèm (PDF, Word, ZIP… tối đa 20 MB/file, có thể chọn nhiều file)</label>
                 <input type="file" name="attachments[]" multiple
@@ -1091,14 +1047,14 @@ elseif ($tab === 'assess'):
     <button onclick="this.closest('#modalEdit').style.display='none'"
             style="position:absolute;top:16px;right:16px;background:none;border:none;font-size:22px;cursor:pointer;color:#64748b;">✕</button>
     <h2 style="font-size:18px;font-weight:800;color:#001634;margin-bottom:20px;">✏ Chỉnh sửa Bài tập</h2>
-    <form method="POST">
+    <form method="POST" enctype="multipart/form-data">
                     <?= csrf_input() ?>
         <input type="hidden" name="_action"      value="edit_assignment" />
         <input type="hidden" name="assignment_id" id="editAsgId" />
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
             <div style="grid-column:1/-1;">
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Tiêu đề *</label>
-                <input type="text" name="title" id="editTitle" required maxlength="255"
+                <input type="text" name="title" id="editTitle" required maxlength="200"
                        style="width:100%;height:38px;border:1px solid #e2e8f0;border-radius:8px;padding:0 12px;font-size:13px;outline:none;" />
             </div>
             <div style="grid-column:1/-1;">
@@ -1106,60 +1062,43 @@ elseif ($tab === 'assess'):
                 <textarea name="description" id="editDesc" rows="3"
                           style="width:100%;border:1px solid #e2e8f0;border-radius:8px;padding:10px;font-size:13px;outline:none;resize:vertical;"></textarea>
             </div>
+            <div style="grid-column:1/-1;">
+                <label for="editInstructions" style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Hướng dẫn chi tiết (Instructions)</label>
+                <textarea name="instructions" id="editInstructions" rows="3"
+                          style="width:100%;border:1px solid #e2e8f0;border-radius:8px;padding:10px;font-size:13px;outline:none;resize:vertical;"></textarea>
+            </div>
+            <div>
+                <label for="editPublication" style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Ngày công bố (tùy chọn)</label>
+                <input type="datetime-local" name="publication_date" id="editPublication" step="1"
+                       style="width:100%;height:38px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;outline:none;" />
+            </div>
             <div>
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Hạn nộp *</label>
-                <input type="datetime-local" name="due_date" id="editDue" required
+                <input type="datetime-local" name="due_date" id="editDue" required step="1"
                        style="width:100%;height:38px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;outline:none;" />
             </div>
             <div>
                 <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Điểm tối đa *</label>
-                <input type="number" name="max_score" id="editMax" required min="1" max="100"
+                <input type="number" name="max_score" id="editMax" required min="0.01" max="999.99" step="0.01"
                        style="width:100%;height:38px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;outline:none;" />
+            </div>
+            <label style="grid-column:1/-1;display:flex;align-items:center;gap:8px;font-size:13px;color:#334155;cursor:pointer;">
+                <input type="hidden" name="allow_resubmission" value="0" />
+                <input type="checkbox" name="allow_resubmission" id="editResubmission" value="1" />
+                <span>Cho phép sinh viên nộp lại khi bài tập còn mở</span>
+            </label>
+            <div style="grid-column:1/-1;">
+                <label for="editAttachments" style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Thêm tài liệu (tối đa 20 MB/file, có thể chọn nhiều file)</label>
+                <input type="file" name="attachments[]" id="editAttachments" multiple
+                       accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.zip,.jpg,.jpeg,.png,.txt"
+                       style="font-size:13px;width:100%;" />
+                <div style="font-size:12px;color:#64748b;margin-top:6px;">Các tài liệu đã có được giữ nguyên.</div>
             </div>
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:20px;">
             <button type="button" onclick="document.getElementById('modalEdit').style.display='none'"
                     class="lbtn lbtn--outline">Hủy</button>
             <button type="submit" class="lbtn lbtn--primary">Lưu thay đổi</button>
-        </div>
-    </form>
-</div></div>
-
-<!-- ══ MODAL: GRADE SUBMISSION ═════════════════════════════════ -->
-<div id="modalGrade" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center;">
-<div style="background:#fff;border-radius:16px;width:100%;max-width:440px;padding:28px;position:relative;">
-    <button onclick="document.getElementById('modalGrade').style.display='none'"
-            style="position:absolute;top:16px;right:16px;background:none;border:none;font-size:22px;cursor:pointer;color:#64748b;">✕</button>
-    <h2 style="font-size:18px;font-weight:800;color:#001634;margin-bottom:4px;">✅ Chấm bài</h2>
-    <p id="gradeStudentName" style="font-size:13px;color:#64748b;margin-bottom:20px;"></p>
-    <form method="POST">
-                    <?= csrf_input() ?>
-        <input type="hidden" name="_action"      value="grade_submission" />
-        <input type="hidden" name="submission_id" id="gradeSubId" />
-        <div style="display:flex;flex-direction:column;gap:14px;">
-            <div>
-                <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">
-                    Điểm (0 – <span id="gradeMaxLabel">10</span>) *
-                </label>
-                <input type="number" name="score" id="gradeScore"
-                       min="0" step="0.5" required
-                       style="width:100%;height:40px;border:1px solid #e2e8f0;border-radius:8px;padding:0 12px;font-size:18px;font-weight:700;outline:none;" />
-            </div>
-            <div>
-                <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Nhận xét</label>
-                <textarea name="feedback" id="gradeFeedback" rows="3"
-                          placeholder="Nhận xét về bài nộp (tùy chọn)..."
-                          style="width:100%;border:1px solid #e2e8f0;border-radius:8px;padding:10px;font-size:13px;outline:none;resize:vertical;"></textarea>
-            </div>
-            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
-                <input type="checkbox" name="publish" id="gradePublish" />
-                <span>Công bố điểm cho sinh viên ngay</span>
-            </label>
-        </div>
-        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:20px;">
-            <button type="button" onclick="document.getElementById('modalGrade').style.display='none'"
-                    class="lbtn lbtn--outline">Hủy</button>
-            <button type="submit" class="lbtn lbtn--primary">💾 Lưu điểm</button>
         </div>
     </form>
 </div></div>
@@ -1189,24 +1128,13 @@ function openEdit(asg) {
     document.getElementById('editAsgId').value  = asg.assignment_id;
     document.getElementById('editTitle').value  = asg.title;
     document.getElementById('editDesc').value   = asg.description || '';
+    document.getElementById('editInstructions').value = asg.instructions || '';
+    document.getElementById('editPublication').value = (asg.publication_date || '').replace(' ', 'T');
     document.getElementById('editMax').value    = asg.max_score;
-    // Format datetime-local
-    if (asg.due_date) {
-        var d = asg.due_date.replace(' ', 'T').substring(0, 16);
-        document.getElementById('editDue').value = d;
-    }
+    document.getElementById('editResubmission').checked = Number(asg.allow_resubmission == null ? 1 : asg.allow_resubmission) === 1;
+    document.getElementById('editAttachments').value = '';
+    document.getElementById('editDue').value = (asg.due_date || '').replace(' ', 'T');
     document.getElementById('modalEdit').style.display = 'flex';
-}
-
-function openGrade(subId, studentName, score, feedback, maxScore) {
-    document.getElementById('gradeSubId').value       = subId;
-    document.getElementById('gradeStudentName').textContent = studentName;
-    document.getElementById('gradeScore').value       = score !== null ? score : '';
-    document.getElementById('gradeScore').max         = maxScore;
-    document.getElementById('gradeMaxLabel').textContent = maxScore;
-    document.getElementById('gradeFeedback').value    = feedback;
-    document.getElementById('gradePublish').checked   = false;
-    document.getElementById('modalGrade').style.display = 'flex';
 }
 
 function escapeHistoryHtml(value) {
@@ -1229,8 +1157,8 @@ function openHistory(subId, studentName) {
         body.innerHTML = '<p style="font-size:13px;color:#94a3b8;">Chưa có lịch sử chấm điểm cho bài nộp này.</p>';
     } else {
         body.innerHTML = rows.map(function(r) {
-            var oldScore = (r.old_score === null || r.old_score === '') ? '—' : Number(r.old_score).toFixed(1);
-            var newScore = (r.new_score === null || r.new_score === '') ? '—' : Number(r.new_score).toFixed(1);
+            var oldScore = (r.old_score === null || r.old_score === '') ? '—' : Number(r.old_score).toFixed(2);
+            var newScore = (r.new_score === null || r.new_score === '') ? '—' : Number(r.new_score).toFixed(2);
             var st = r.new_grade_status === 'Published' ? '✅ Đã công bố' : '📝 Nháp';
             var by = r.username ? r.username : 'Giảng viên';
             var fb = r.new_feedback

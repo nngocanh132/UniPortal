@@ -69,14 +69,18 @@ foreach ($trendRows as $t) {
     $trendLabels[] = preg_replace('/^Học kỳ\s*/i','HK',$t['semester_name']??'').' '.$ayShort;
     $trendVals[]   = (float)$t['gpa'];
 }
-// Fallback trend if no data
-if (empty($trendLabels)) {
-    $trendLabels = ['HK1 24-25','HK2 24-25','HK1 25-26','HK2 25-26','HK1 26-27'];
-    $trendVals   = [2.86, 2.86, 2.89, 2.91, 2.94];
-}
 
 $jsLabels = json_encode($trendLabels, JSON_UNESCAPED_UNICODE);
 $jsVals   = json_encode($trendVals);
+
+// Keep the y-axis snug around the actual data
+$yMin = 0.0;
+$yMax = 4.0;
+if (!empty($trendVals)) {
+    $yMin = max(0, floor((min($trendVals) - 0.15) * 10) / 10);
+    $yMax = min(4, ceil((max($trendVals) + 0.15) * 10) / 10);
+    if ($yMax - $yMin < 0.6) { $yMax = min(4, $yMin + 0.6); }
+}
 
 $warnCount = $unreadWarnings;
 
@@ -92,7 +96,7 @@ require __DIR__ . '/_layout.php';
     <!-- Tổng số sinh viên -->
     <div class="acard adm-kpi">
         <div class="adm-kpi__header">
-            <span class="adm-kpi__label">Tổng số sinh<br/>viên</span>
+            <span class="adm-kpi__label">Tổng số sinh viên</span>
             <span class="adm-kpi__icon adm-kpi__icon--blue">
                 <img src="../img/db-nav-profile.svg" alt="" />
             </span>
@@ -101,13 +105,13 @@ require __DIR__ . '/_layout.php';
             <span class="adm-kpi__num"><?= number_format($totalStudents) ?></span>
             <span class="adm-kpi__unit">SV</span>
         </div>
-        <div class="adm-kpi__sub adm-kpi__sub--up">↗ <?= max(0, $totalStudents) ?> so với cùng kỳ •</div>
+        <div class="adm-kpi__sub"><?= number_format($totalAccounts) ?> tài khoản đang hoạt động</div>
     </div>
 
     <!-- GPA trung bình trường -->
     <div class="acard adm-kpi">
         <div class="adm-kpi__header">
-            <span class="adm-kpi__label">GPA trung bình<br/>trường</span>
+            <span class="adm-kpi__label">GPA trung bình trường</span>
             <span class="adm-kpi__icon adm-kpi__icon--green">
                 <img src="../img/db-nav-grades.svg" alt="" />
             </span>
@@ -116,13 +120,13 @@ require __DIR__ . '/_layout.php';
             <span class="adm-kpi__num"><?= $avgGpa !== null ? number_format($avgGpa,2) : '—' ?></span>
             <span class="adm-kpi__unit">/ 4.0</span>
         </div>
-        <div class="adm-kpi__sub adm-kpi__sub--up">↑ +0.08 &nbsp;<span style="color:#94a3b8;">Xếp loại Khá toàn diện</span></div>
+        <div class="adm-kpi__sub"><?= number_format($gpaCount) ?> sinh viên đã có điểm</div>
     </div>
 
     <!-- Cảnh báo học tập -->
     <div class="acard adm-kpi" style="border-left: 4px solid #ef4444;">
         <div class="adm-kpi__header">
-            <span class="adm-kpi__label">Cảnh báo học<br/>tập</span>
+            <span class="adm-kpi__label">Cảnh báo học tập</span>
             <span class="adm-kpi__icon adm-kpi__icon--red">
                 <img src="../img/db-nav-alerts.svg" alt="" />
             </span>
@@ -132,16 +136,8 @@ require __DIR__ . '/_layout.php';
             <span class="adm-kpi__unit">hồ sơ</span>
         </div>
         <div class="adm-kpi__sub-row">
-            <span class="adm-kpi__sub-item adm-kpi__sub--down">
-                ↓ <?= (int)ceil($activeWarnings*0.18) ?> SV
-                <span style="color:#94a3b8;">(<?= $activeWarnings>0?number_format($activeWarnings/$totalStudents*100,1):0 ?>%)</span>
-            </span>
-            <span class="adm-kpi__sub-item" style="color:#f59e0b;">
-                • <?= $unreadWarnings ?> <span style="color:#94a3b8;">Nguy cơ</span>
-            </span>
-            <span class="adm-kpi__sub-item">
-                • <?= $activeWarnings - $unreadWarnings ?> <span style="color:#94a3b8;">Theo dõi</span>
-            </span>
+            <span class="adm-kpi__sub-item" style="color:#f59e0b;"><?= $unreadWarnings ?> chưa đọc</span>
+            <span class="adm-kpi__sub-item"><?= $activeWarnings - $unreadWarnings ?> đã đọc</span>
         </div>
     </div>
 </div>
@@ -149,26 +145,30 @@ require __DIR__ . '/_layout.php';
 <!-- ═══ GPA TREND ════════════════════════════════════════════ -->
 <div class="adm-dash-lower" style="grid-template-columns:1fr;">
 
-    <!-- Tiến trình GPA 5 Học kỳ -->
-    <div class="acard" style="padding:20px 24px;">
+    <!-- Diễn biến GPA theo học kỳ -->
+    <div class="acard" style="padding:18px 20px;">
         <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
             <span style="width:10px;height:10px;border-radius:50%;background:#fdcc35;display:inline-block;"></span>
-            <span class="adm-section-title">Tiến trình GPA 5 Học kỳ</span>
+            <span class="adm-section-title">Diễn biến GPA theo học kỳ</span>
         </div>
+        <?php if (!empty($trendRows)): ?>
         <div class="adm-section-sub" style="margin-bottom:14px;">
-            Giai đoạn từ <?= $trendLabels[0] ?? 'HK1 24-25' ?> đến <?= end($trendLabels) ?>
+            Giai đoạn từ <?= h($trendLabels[0]) ?> đến <?= h(end($trendLabels)) ?>
         </div>
-        <div style="position:relative;height:160px;">
+        <div style="position:relative;height:170px;">
             <canvas id="trendChart"></canvas>
         </div>
-        <div style="margin-top:10px;font-size:12px;color:#64748b;">
-            Tỷ lệ hoàn thành tín chỉ: <strong style="color:#001634;">96.8%</strong>
-            <span style="color:#22c55e;margin-left:4px;">↑ +4.2%</span>
+        <?php else: ?>
+        <div class="adm-empty">
+            <div class="adm-empty__icon">📈</div>
+            <p>Chưa có dữ liệu điểm để dựng biểu đồ GPA.</p>
         </div>
+        <?php endif; ?>
     </div>
 
 </div>
 
+<?php if (!empty($trendRows)): ?>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js" crossorigin="anonymous"></script>
 <script>
 Chart.defaults.font.family = "'Inter', 'Be Vietnam Pro', sans-serif";
@@ -198,7 +198,7 @@ new Chart(document.getElementById('trendChart'), {
             tooltip: { callbacks: { label: ctx => ' GPA: ' + ctx.parsed.y.toFixed(2) } }
         },
         scales: {
-            y: { min: 2.5, max: 3.2,
+            y: { min: <?= $yMin ?>, max: <?= $yMax ?>,
                  ticks: { font: { size: 10 }, color: '#94a3b8', stepSize: 0.2 },
                  grid: { color: 'rgba(0,0,0,.04)' } },
             x: { ticks: { font: { size: 10 }, color: '#94a3b8' }, grid: { display: false } }
@@ -206,5 +206,6 @@ new Chart(document.getElementById('trendChart'), {
     }
 });
 </script>
+<?php endif; ?>
 
 <?php require __DIR__ . '/_layout_end.php'; ?>

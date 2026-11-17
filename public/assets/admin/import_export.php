@@ -225,7 +225,7 @@ $activeSemId = 4;
 foreach ($semesters as $s) { if ($s['status'] ?? '' === 'Active') { $activeSemId = (int)$s['semester_id']; break; } }
 
 $warnCount  = (int)$pdo->query("SELECT COUNT(*) FROM AcademicWarning WHERE status='Active' AND is_read=FALSE")->fetchColumn();
-$pageTitle  = 'Import & Export dữ liệu';
+$pageTitle  = 'Import & Export';
 $activePage = 'import_export';
 $breadcrumb = 'Quản trị › Import & Export';
 require __DIR__ . '/_layout.php';

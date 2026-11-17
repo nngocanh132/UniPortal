@@ -1193,22 +1193,23 @@ button { font-family: var(--font); cursor: pointer; }
 /* Stat row for attendance overview */
 .stat-row {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
 }
 
 .stat-mini {
     background: var(--bg-card);
     border-radius: var(--radius-card);
-    padding: 16px 20px;
+    padding: 13px 16px;
     box-shadow: var(--shadow-card);
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 1px;
+    min-width: 0;
 }
-.stat-mini__label { font-size: 11px; font-weight: 600; color: var(--txt-muted); text-transform: uppercase; }
-.stat-mini__value { font-size: 28px; font-weight: 700; color: var(--navy-dark); line-height: 1.2; }
-.stat-mini__sub   { font-size: 11px; color: var(--txt-muted); }
+.stat-mini__label { font-size: 10.5px; font-weight: 600; color: var(--txt-muted); text-transform: uppercase; letter-spacing: .03em; }
+.stat-mini__value { font-size: 24px; font-weight: 700; color: var(--navy-dark); line-height: 1.25; }
+.stat-mini__sub   { font-size: 10.5px; color: var(--txt-muted); }
 
 /* Alert warning card */
 .warning-card {
@@ -1321,7 +1322,10 @@ button { font-family: var(--font); cursor: pointer; }
     .forecast-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 600px) {
-    .stat-row { grid-template-columns: 1fr; }
+    .stat-row { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .stat-mini { padding: 11px 13px; }
+    .stat-mini__value { font-size: 21px; }
+    .stat-mini__sub { font-size: 10px; line-height: 14px; }
     .filter-ribbon { flex-direction: column; align-items: stretch; }
     .filter-ribbon__search { flex: none; }
 }

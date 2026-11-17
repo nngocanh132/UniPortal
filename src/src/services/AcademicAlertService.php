@@ -22,6 +22,7 @@
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/SystemConfig.php';
 require_once __DIR__ . '/NotificationService.php';
+require_once __DIR__ . '/AttendanceService.php';
 
 class AcademicAlertService {
 
@@ -53,28 +54,36 @@ class AcademicAlertService {
 
         // 2. GPA-based warnings (university-wide, not per-course)
         if ($gpa !== null) {
+            $suspensionGpa = SystemConfig::getFloat('gpa_suspension_threshold', 1.50);
             $warningsCreated += self::checkAndCreateWarning(
                 $pdo, $student_id, 'LowGPA',
                 SystemConfig::isLowGpa($gpa),
                 sprintf(
-                    'GPA tích lũy hiện tại là %.2f – dưới ngưỡng cảnh báo %.2f. Cần cải thiện kết quả học tập.',
+                    "GPA tích lũy hiện tại là %.2f – dưới ngưỡng cảnh báo %.2f. Cần cải thiện kết quả học tập.\n" .
+                    "Đề xuất: Gặp cố vấn học tập để xây dựng kế hoạch cải thiện GPA.",
                     $gpa,
                     SystemConfig::getFloat('gpa_warning_threshold', 2.00)
-                )
+                ),
+                $gpa < $suspensionGpa ? 3 : 2
             );
 
             $warningsCreated += self::checkAndCreateWarning(
                 $pdo, $student_id, 'GraduationRisk',
-                $gpa < SystemConfig::getFloat('gpa_suspension_threshold', 1.50),
+                $gpa < $suspensionGpa,
                 sprintf(
-                    'GPA tích lũy %.2f thấp nguy hiểm. Có nguy cơ đình chỉ học hoặc không đủ điều kiện tốt nghiệp.',
+                    "GPA tích lũy %.2f thấp nguy hiểm. Có nguy cơ đình chỉ học hoặc không đủ điều kiện tốt nghiệp.\n" .
+                    "Đề xuất: Liên hệ ngay cố vấn học tập và Phòng Đào tạo để được hỗ trợ.",
                     $gpa
-                )
+                ),
+                3
             );
         }
 
         // 3. Per-course attendance check (Active semester)
         $warningsCreated += self::checkAllAttendance($student_id);
+
+        // 4. Per-course performance check (grades, missing work, trend)
+        $warningsCreated += self::checkAllPerformance($student_id);
 
         return [
             'gpa'              => $gpa,
@@ -89,7 +98,7 @@ class AcademicAlertService {
     public static function checkAllAttendance(string $student_id): int {
         $pdo = get_db();
 
-        // Get all sections where student is enrolled AND attendance exists
+        // Get all sections where student is enrolled AND official sessions exist
         $stmt = $pdo->prepare(
             'SELECT DISTINCT e.enrollment_id, e.section_id,
                     c.course_code, c.course_name, c.credits
@@ -99,10 +108,9 @@ class AcademicAlertService {
              WHERE e.student_id = :sid
                AND e.status IN (\'Enrolled\', \'Completed\')
                AND EXISTS (
-                   SELECT 1 FROM Attendance a
-                   JOIN AttendanceSession ats ON ats.session_id = a.session_id
-                   WHERE a.enrollment_id = e.enrollment_id
-                     AND ats.section_id  = e.section_id
+                   SELECT 1 FROM AttendanceSession ats
+                   WHERE ats.section_id = e.section_id
+                     AND ats.status <> \'Cancelled\'
                )'
         );
         $stmt->execute([':sid' => $student_id]);
@@ -134,75 +142,69 @@ class AcademicAlertService {
     ): int {
         $pdo = get_db();
 
-        // Get attendance stats for this enrollment in this section
-        $stmt = $pdo->prepare(
-            "SELECT
-                COUNT(*)                                AS total,
-                SUM(a.status = 'Absent')                AS absent_count,
-                SUM(a.status = 'Late')                  AS late_count,
-                SUM(a.status = 'Present')               AS present_count,
-                SUM(a.status = 'Excused')                AS excused_count
-             FROM Attendance a
-             WHERE a.enrollment_id = :eid"
-        );
-        $stmt->execute([':eid' => $enrollment_id]);
-        $att = $stmt->fetch();
+        // Official-session based statistics (cancelled/future/pending excluded).
+        $policy = AttendanceService::policy();
+        $stats  = AttendanceService::studentSectionStats($pdo, $enrollment_id, $section_id, $policy);
 
-        $total  = (int)($att['total'] ?? 0);
-        $absent = (int)($att['absent_count'] ?? 0);
+        if ($stats['official_total'] === 0 || $stats['completed_total'] === 0) return 0;
 
-        if ($total === 0) return 0; // no attendance recorded yet
+        $absent  = (int)$stats['absent_counted'];
+        $total   = (int)$stats['official_total'];
+        $absentPct = (float)$stats['absent_pct'];
+        $banPct  = (float)$policy['ban_pct'];
+        $remainingAllowed = (int)$stats['remaining_allowed'];
 
-        // Calculate absent percentage (only 'Absent' counts — Excused doesn't)
-        $absentPct = ($absent / $total) * 100;
-
-        // Configurable thresholds from SystemConfig
-        $warnPct  = SystemConfig::getFloat('attendance_warn_pct', 15.0);
-        $banPct   = SystemConfig::getFloat('attendance_ban_pct',  20.0);
-
-        // Determine warning level using STRICT > rule (not >=)
-        // Level 3: absent% > ban_pct (strictly greater than 20%)
-        // Level 2: absent% >= ban_pct (exactly at ban threshold = critical)
-        // Level 1: absent% >= warn_pct (approaching)
-        $level   = 0;
+        $level = 0;
         $condition = false;
-        $msg     = '';
+        $msg = '';
 
-        if ($absentPct > $banPct) {
-            // Level 3 – Examination Prohibition Risk
+        if ($stats['status'] === 'ineligible') {
+            // Strictly above the ban threshold – examination prohibition.
             $level = 3;
             $condition = true;
-            $remainingAllowed = (int)floor($total * $banPct / 100) - $absent;
             $msg = sprintf(
-                "🚫 CẤM THI RỦI RO: Môn %s (%s) — Tỷ lệ vắng %d/%d buổi (%.1f%%) > %d%%.\n" .
-                "Bạn có thể bị CẤM THI môn này theo quy chế đào tạo. Vui lòng liên hệ giảng viên hoặc Phòng Đào tạo.",
+                "🚫 CẤM THI RỦI RO: Môn %s (%s) — Tỷ lệ vắng %d/%d buổi chính thức (%.1f%%) > %d%%.\n" .
+                "Bạn có thể bị CẤM THI môn này theo quy chế đào tạo.\n" .
+                "Đề xuất: Liên hệ ngay giảng viên và Phòng Đào tạo để được hướng dẫn xử lý.",
                 $course_name, $course_code, $absent, $total, $absentPct, (int)$banPct
             );
-        } elseif (abs($absentPct - $banPct) < 0.01) {
-            // Exactly at 20% — critical but not yet prohibited
+        } elseif ($stats['status'] === 'eligible' && (int)$stats['risk_level'] === 2) {
+            // Exactly at the threshold – still eligible, but critical.
             $level = 2;
             $condition = true;
             $msg = sprintf(
-                "⚠️ CẢNH BÁO NGHIÊM TRỌNG: Môn %s (%s) — Tỷ lệ vắng %d/%d buổi = %.0f%%.\n" .
-                "Bạn đang ở ngưỡng cấm thi (%d%%). Vắng thêm 1 buổi sẽ bị cấm thi!",
+                "⚠️ CẢNH BÁO NGHIÊM TRỌNG: Môn %s (%s) — Tỷ lệ vắng %d/%d buổi = %.1f%%.\n" .
+                "Bạn đang ở ngưỡng cấm thi (%d%%). Vắng thêm 1 buổi sẽ bị cấm thi!\n" .
+                "Đề xuất: Tham dự đầy đủ 100%% các buổi còn lại, xin phép hợp lệ nếu bắt buộc vắng.",
                 $course_name, $course_code, $absent, $total, $absentPct, (int)$banPct
             );
-        } elseif ($absentPct >= $warnPct) {
-            // Level 1 – Attention
+        } elseif ($stats['status'] === 'at_risk') {
+            // Approaching the threshold.
             $level = 1;
             $condition = true;
-            $remainingAllowed = (int)floor($total * $banPct / 100) - $absent;
             $msg = sprintf(
                 "📋 Chú ý chuyên cần: Môn %s (%s) — Tỷ lệ vắng %d/%d buổi (%.1f%%).\n" .
-                "Còn %d buổi vắng được phép trước khi bị cấm thi. Hãy cải thiện tỷ lệ chuyên cần.",
+                "Còn %d buổi vắng được phép trước khi bị cấm thi.\n" .
+                "Đề xuất: Theo dõi chuyên cần và không vắng thêm buổi nào.",
                 $course_name, $course_code, $absent, $total, $absentPct,
-                max(0, $remainingAllowed)
+                $remainingAllowed
+            );
+        } elseif ($stats['status'] === 'eligible' && $remainingAllowed === 1 && $absent > 0) {
+            // One more absence reaches the ban threshold – gentle reminder.
+            $level = 1;
+            $condition = true;
+            $msg = sprintf(
+                "📋 Nhắc nhở chuyên cần: Môn %s (%s) — Đã vắng %d/%d buổi (%.1f%%).\n" .
+                "Chỉ còn %d buổi vắng được phép trước khi bị cấm thi.\n" .
+                "Đề xuất: Tham dự đầy đủ các buổi còn lại và theo dõi chuyên cần.",
+                $course_name, $course_code, $absent, $total, $absentPct,
+                $remainingAllowed
             );
         }
 
         // Find existing per-course Attendance warning for this section
         $find = $pdo->prepare(
-            'SELECT warning_id, warning_level FROM AcademicWarning
+            'SELECT warning_id, warning_level, message FROM AcademicWarning
              WHERE student_id = :sid
                AND warning_type = \'Attendance\'
                AND section_id = :sec
@@ -235,14 +237,19 @@ class AcademicAlertService {
         }
 
         if ($condition && $existing) {
-            // Update existing warning if level changed
-            if ((int)$existing['warning_level'] !== $level) {
+            // Keep the stored message in sync with the current numbers; only
+            // jump back to unread when the severity level changes.
+            $levelChanged = (int)$existing['warning_level'] !== $level;
+            if ($levelChanged || $existing['message'] !== $msg) {
                 $upd = $pdo->prepare(
-                    'UPDATE AcademicWarning SET message = :msg, warning_level = :lvl, is_read = FALSE
-                     WHERE warning_id = :wid'
+                    'UPDATE AcademicWarning SET message = :msg, warning_level = :lvl'
+                    . ($levelChanged ? ', is_read = FALSE' : '')
+                    . ' WHERE warning_id = :wid'
                 );
                 $upd->execute([':msg' => $msg, ':lvl' => $level, ':wid' => $existing['warning_id']]);
-                self::notifyStudent($student_id, 'Cập nhật cảnh báo chuyên cần', $msg);
+                if ($levelChanged) {
+                    self::notifyStudent($student_id, 'Cập nhật cảnh báo chuyên cần', $msg);
+                }
             }
             return 0;
         }
@@ -263,43 +270,284 @@ class AcademicAlertService {
         return 0;
     }
 
+    // ── Performance check: all currently enrolled sections ────
+    public static function checkAllPerformance(string $student_id): int {
+        $pdo = get_db();
+        $stmt = $pdo->prepare(
+            "SELECT e.enrollment_id, e.section_id, c.course_code, c.course_name
+             FROM Enrollment e
+             JOIN ClassSection cs ON cs.section_id = e.section_id
+             JOIN Course c        ON c.course_id   = cs.course_id
+             WHERE e.student_id = :sid
+               AND e.status = 'Enrolled'
+               AND cs.section_status <> 'Cancelled'"
+        );
+        $stmt->execute([':sid' => $student_id]);
+
+        $created = 0;
+        foreach ($stmt->fetchAll() as $sec) {
+            $created += self::checkPerformanceForSection(
+                $student_id,
+                (int)$sec['section_id'],
+                (int)$sec['enrollment_id'],
+                $sec['course_code'],
+                $sec['course_name']
+            );
+        }
+        return $created;
+    }
+
+    // ── Performance check for one course/section ──────────────
+    // Uses the real assessment weights and recorded Grade rows; never
+    // invents scores. Thresholds come from SystemConfig.
+    public static function checkPerformanceForSection(
+        string $student_id,
+        int    $section_id,
+        int    $enrollment_id,
+        string $course_code,
+        string $course_name
+    ): int {
+        $pdo = get_db();
+
+        $threshold     = SystemConfig::getFloat('grade_warning_threshold', 5.00);
+        $compThreshold = SystemConfig::getFloat('grade_component_threshold', 5.00);
+        $declineDelta  = SystemConfig::getFloat('grade_decline_delta', 1.00);
+        $target        = SystemConfig::getFloat('grade_target_score', 5.50);
+        $missingLimit  = max(1, SystemConfig::getInt('assignment_missing_warning', 2));
+
+        $aStmt = $pdo->prepare(
+            'SELECT a.assessment_id, a.assessment_name, a.weight_percent, a.due_date, g.score
+             FROM Assessment a
+             LEFT JOIN Grade g ON g.assessment_id = a.assessment_id
+                              AND g.enrollment_id = :eid
+             WHERE a.section_id = :sec
+             ORDER BY a.due_date IS NULL, a.due_date, a.assessment_id'
+        );
+        $aStmt->execute([':eid' => $enrollment_id, ':sec' => $section_id]);
+        $assessments = $aStmt->fetchAll();
+        if (!$assessments) return 0;
+
+        $graded = [];
+        $weightedSum = 0.0;
+        $gradedWeight = 0.0;
+        $remainingWeight = 0.0;
+        $totalWeight = 0.0;
+        $lowComponents = [];
+        $lowMidterm = null;
+        $preByDate = null;
+
+        foreach ($assessments as $a) {
+            $w = (float)$a['weight_percent'];
+            $totalWeight += $w;
+            if ($a['score'] === null) {
+                $remainingWeight += $w;
+                continue;
+            }
+            $s10 = round((float)$a['score'] / 10, 2);
+            $name = (string)$a['assessment_name'];
+            $weightedSum += $s10 * $w;
+            $gradedWeight += $w;
+            $graded[] = ['name' => $name, 'score' => $s10];
+
+            $isMidterm = mb_stripos($name, 'giữa kỳ') !== false;
+            $isCoursework = mb_stripos($name, 'quá trình') !== false
+                         || mb_stripos($name, 'thường xuyên') !== false
+                         || mb_stripos($name, 'chuyên cần') !== false;
+            if ($isMidterm && $s10 < $compThreshold) {
+                if ($lowMidterm === null || $s10 < $lowMidterm['score']) {
+                    $lowMidterm = ['name' => $name, 'score' => $s10];
+                }
+            } elseif ($isCoursework && $s10 < $compThreshold) {
+                $lowComponents[] = ['name' => $name, 'score' => $s10];
+            }
+
+            // Declining trend between consecutive graded assessments.
+            if ($preByDate !== null && ($preByDate - $s10) >= $declineDelta) {
+                $trend = ['from' => $preByDate, 'to' => $s10];
+            }
+            $preByDate = $s10;
+        }
+        $trend = $trend ?? null;
+
+        $avg10 = $gradedWeight > 0 ? round($weightedSum / $gradedWeight, 2) : null;
+        $requiredFinal = ($remainingWeight > 0 && $avg10 !== null)
+            ? round((($target * $totalWeight) - $weightedSum) / $remainingWeight, 2)
+            : null;
+
+        // Missing (overdue, unsubmitted) assignments for this enrollment.
+        $mStmt = $pdo->prepare(
+            "SELECT COUNT(*) FROM Assignment a
+             LEFT JOIN Submission s ON s.assignment_id = a.assignment_id
+                                   AND s.enrollment_id = :eid
+             WHERE a.section_id = :sec
+               AND a.is_deleted = 0
+               AND a.status = 'Published'
+               AND a.due_date < NOW()
+               AND s.submission_id IS NULL"
+        );
+        $mStmt->execute([':eid' => $enrollment_id, ':sec' => $section_id]);
+        $missing = (int)$mStmt->fetchColumn();
+
+        // ── Decide severity ──────────────────────────────────
+        $belowThreshold = $avg10 !== null && $avg10 < $threshold;
+        $impossibleTarget = $requiredFinal !== null && $requiredFinal > 10 && $gradedWeight >= 30;
+        $hasIssues = $belowThreshold || $lowMidterm !== null || $lowComponents
+                  || $trend !== null || $missing >= $missingLimit || $impossibleTarget;
+
+        $find = $pdo->prepare(
+            "SELECT warning_id, warning_level, message FROM AcademicWarning
+             WHERE student_id = :sid
+               AND warning_type = 'LowGrade'
+               AND section_id = :sec
+               AND status = 'Active'
+             LIMIT 1"
+        );
+        $find->execute([':sid' => $student_id, ':sec' => $section_id]);
+        $existing = $find->fetch();
+
+        if (!$hasIssues) {
+            if ($existing) {
+                $pdo->prepare("UPDATE AcademicWarning SET status='Resolved', is_read=TRUE WHERE warning_id=:wid")
+                    ->execute([':wid' => $existing['warning_id']]);
+                self::writeAuditLog($pdo, 25, 'RESOLVE_GRADE_WARNING', 'AcademicWarning', $student_id,
+                    json_encode(['section_id' => $section_id]), null);
+            }
+            return 0;
+        }
+
+        $level = 1;
+        if ($impossibleTarget || ($belowThreshold && $avg10 !== null && $avg10 < $threshold - 1.0)) {
+            $level = 3;
+        } elseif ($belowThreshold || $lowMidterm !== null || $missing >= $missingLimit) {
+            $level = 2;
+        }
+        $levelLabel = [1 => 'Nhắc nhở', 2 => 'Cần chú ý', 3 => 'Nguy cơ cao'][$level];
+
+        $details = [];
+        if ($avg10 !== null) {
+            $details[] = sprintf('Điểm trung bình hiện tại: %.2f/10 (đã chấm %d%% trọng số).',
+                $avg10, (int)round($gradedWeight));
+        }
+        if ($lowComponents) {
+            $c = $lowComponents[0];
+            $details[] = sprintf('%s chỉ đạt %.2f/10 (ngưỡng %.2f/10).', $c['name'], $c['score'], $compThreshold);
+        }
+        if ($lowMidterm !== null) {
+            $details[] = sprintf('%s đạt %.2f/10, dưới ngưỡng %.2f/10.',
+                $lowMidterm['name'], $lowMidterm['score'], $compThreshold);
+        }
+        if ($trend !== null) {
+            $details[] = sprintf('Điểm có xu hướng giảm: từ %.2f xuống %.2f/10.', $trend['from'], $trend['to']);
+        }
+        if ($missing >= $missingLimit) {
+            $details[] = sprintf('Có %d bài tập quá hạn chưa nộp.', $missing);
+        }
+        if ($requiredFinal !== null) {
+            $details[] = $requiredFinal > 10
+                ? sprintf('Mục tiêu %.2f/10 không thể đạt dù phần còn lại đạt tối đa.', $target)
+                : sprintf('Để đạt mục tiêu %.2f/10, phần còn lại cần %.2f/10.', $target, max(0, $requiredFinal));
+        }
+
+        $mainIssue = $level === 3
+            ? ($impossibleTarget ? 'khó đạt điểm mục tiêu' : 'kết quả học tập rất thấp')
+            : ($level === 2
+                ? ($belowThreshold ? 'điểm trung bình dưới ngưỡng' : ($lowMidterm !== null ? 'điểm giữa kỳ thấp' : 'nhiều bài tập chưa nộp'))
+                : ($lowComponents ? 'điểm quá trình cần cải thiện' : 'kết quả học tập cần theo dõi'));
+        $action = $level === 3
+            ? 'Liên hệ giảng viên để được hỗ trợ, hoàn thành ngay các bài còn thiếu và xây dựng kế hoạch học tập trước khi thi cuối kỳ.'
+            : ($level === 2
+                ? 'Ôn lại các phần kiến thức bị điểm thấp, nộp bổ sung bài tập còn thiếu và trao đổi với giảng viên.'
+                : 'Theo dõi điểm số thường xuyên và cải thiện ở các bài đánh giá tiếp theo.');
+
+        $msg = sprintf("Môn %s (%s) – %s: %s.\n", $course_name, $course_code, $levelLabel, $mainIssue)
+             . implode("\n", $details)
+             . "\nĐề xuất: " . $action;
+
+        if (!$existing) {
+            $ins = $pdo->prepare(
+                "INSERT INTO AcademicWarning
+                    (student_id, warning_type, warning_level, message, status, is_read, section_id)
+                 VALUES (:sid, 'LowGrade', :lvl, :msg, 'Active', FALSE, :sec)"
+            );
+            $ins->execute([':sid' => $student_id, ':lvl' => $level, ':msg' => $msg, ':sec' => $section_id]);
+
+            self::notifyStudent($student_id, 'Cảnh báo kết quả học tập', $msg);
+            self::writeAuditLog($pdo, 25, 'CREATE_GRADE_WARNING', 'AcademicWarning', $student_id, null,
+                json_encode(['section_id' => $section_id, 'level' => $level, 'course' => $course_code]));
+            return 1;
+        }
+
+        $levelChanged = (int)$existing['warning_level'] !== $level;
+        if ($levelChanged || $existing['message'] !== $msg) {
+            $upd = $pdo->prepare(
+                'UPDATE AcademicWarning SET message = :msg, warning_level = :lvl'
+                . ($levelChanged ? ', is_read = FALSE' : '')
+                . ' WHERE warning_id = :wid'
+            );
+            $upd->execute([':msg' => $msg, ':lvl' => $level, ':wid' => $existing['warning_id']]);
+            if ($levelChanged) {
+                self::notifyStudent($student_id, 'Cập nhật cảnh báo kết quả học tập', $msg);
+            }
+        }
+        return 0;
+    }
+
     // ── Check condition → create or auto-resolve (non-attendance) ─
     private static function checkAndCreateWarning(
         PDO    $pdo,
         string $student_id,
         string $warning_type,
         bool   $condition,
-        string $message
+        string $message,
+        int    $level = 1
     ): int {
         $find = $pdo->prepare(
-            'SELECT warning_id FROM AcademicWarning
+            'SELECT warning_id, warning_level, message FROM AcademicWarning
              WHERE student_id=:sid AND warning_type=:type AND status=\'Active\'
                AND section_id IS NULL
              LIMIT 1'
         );
         $find->execute([':sid' => $student_id, ':type' => $warning_type]);
-        $existing = $find->fetchColumn();
+        $existing = $find->fetch();
 
         if ($condition && !$existing) {
             $ins = $pdo->prepare(
-                'INSERT INTO AcademicWarning (student_id, warning_type, message, status, is_read)
-                 VALUES (:sid, :type, :msg, \'Active\', FALSE)'
+                'INSERT INTO AcademicWarning (student_id, warning_type, message, status, is_read, warning_level)
+                 VALUES (:sid, :type, :msg, \'Active\', FALSE, :lvl)'
             );
-            $ins->execute([':sid' => $student_id, ':type' => $warning_type, ':msg' => $message]);
+            $ins->execute([':sid' => $student_id, ':type' => $warning_type, ':msg' => $message, ':lvl' => $level]);
 
             self::notifyStudent($student_id,
                 $warning_type === 'LowGPA' ? 'GPA thấp' : 'Nguy cơ tốt nghiệp',
                 $message);
             self::writeAuditLog($pdo, 25, 'CREATE_WARNING', 'AcademicWarning', $student_id,
-                null, json_encode(['type' => $warning_type, 'msg' => $message]));
+                null, json_encode(['type' => $warning_type, 'level' => $level, 'msg' => $message]));
             return 1;
+        }
+
+        if ($condition && $existing) {
+            $levelChanged = (int)$existing['warning_level'] !== $level;
+            if ($levelChanged || $existing['message'] !== $message) {
+                $upd = $pdo->prepare(
+                    'UPDATE AcademicWarning SET message = :msg, warning_level = :lvl'
+                    . ($levelChanged ? ', is_read = FALSE' : '')
+                    . ' WHERE warning_id = :wid'
+                );
+                $upd->execute([':msg' => $message, ':lvl' => $level, ':wid' => $existing['warning_id']]);
+                if ($levelChanged) {
+                    self::notifyStudent($student_id,
+                        $warning_type === 'LowGPA' ? 'Cập nhật cảnh báo GPA' : 'Cập nhật nguy cơ tốt nghiệp',
+                        $message);
+                }
+            }
+            return 0;
         }
 
         if (!$condition && $existing) {
             $res = $pdo->prepare(
                 'UPDATE AcademicWarning SET status=\'Resolved\', is_read=TRUE WHERE warning_id=:wid'
             );
-            $res->execute([':wid' => $existing]);
+            $res->execute([':wid' => $existing['warning_id']]);
         }
 
         return 0;
@@ -367,54 +615,48 @@ class AcademicAlertService {
     }
 
     // ── Get attendance risk summary for a student in a section ─
-    // Works for any semester, not just Active.
+    // Official-session based; works for any semester, not just Active.
     public static function getAttendanceRisk(string $student_id, int $section_id): array {
         $pdo = get_db();
-        $stmt = $pdo->prepare(
-            "SELECT
-                COUNT(*)                                AS total,
-                SUM(a.status = 'Absent')                AS absent,
-                SUM(a.status = 'Late')                  AS late,
-                SUM(a.status = 'Present')               AS present,
-                SUM(a.status = 'Excused')               AS excused
-             FROM Attendance a
-             JOIN Enrollment e ON e.enrollment_id = a.enrollment_id
-             WHERE e.student_id = :sid AND e.section_id = :sec"
+        $q = $pdo->prepare(
+            "SELECT enrollment_id FROM Enrollment
+             WHERE student_id = :sid AND section_id = :sec
+               AND status IN ('Enrolled','Completed')
+             ORDER BY enrollment_id DESC LIMIT 1"
         );
-        $stmt->execute([':sid' => $student_id, ':sec' => $section_id]);
-        $att = $stmt->fetch();
-
-        $total  = (int)($att['total'] ?? 0);
-        $absent = (int)($att['absent'] ?? 0);
-        $banPct = SystemConfig::getFloat('attendance_ban_pct', 20.0);
-        $warnPct = SystemConfig::getFloat('attendance_warn_pct', 15.0);
-
-        $absentPct = $total > 0 ? ($absent / $total) * 100 : 0;
-        $banThreshold = (int)floor($total * $banPct / 100);
-        $remaining = max(0, $banThreshold - $absent);
-
-        if ($total === 0) {
-            return ['level' => 0, 'status' => 'no_data', 'total' => 0, 'absent' => 0,
-                    'pct' => 0, 'remaining' => 0];
+        $q->execute([':sid' => $student_id, ':sec' => $section_id]);
+        $enrollmentId = (int)$q->fetchColumn();
+        if (!$enrollmentId) {
+            $policy = AttendanceService::policy();
+            return [
+                'level' => 0, 'status' => 'no_data', 'total' => 0, 'official_total' => 0,
+                'completed_total' => 0, 'absent' => 0, 'late' => 0, 'present' => 0,
+                'excused' => 0, 'pct' => 0, 'remaining' => 0,
+                'ban_pct' => $policy['ban_pct'], 'ban_threshold' => 0,
+                'status_label' => 'Chưa có dữ liệu',
+            ];
         }
 
-        $level = 0; $status = 'ok';
-        if ($absentPct > $banPct) { $level = 3; $status = 'prohibition'; }
-        elseif (abs($absentPct - $banPct) < 0.01) { $level = 2; $status = 'critical'; }
-        elseif ($absentPct >= $warnPct) { $level = 1; $status = 'attention'; }
-
+        $s = AttendanceService::studentSectionStats($pdo, $enrollmentId, $section_id);
         return [
-            'level'        => $level,
-            'status'       => $status,
-            'total'        => $total,
-            'absent'       => $absent,
-            'late'         => (int)($att['late'] ?? 0),
-            'present'      => (int)($att['present'] ?? 0),
-            'excused'      => (int)($att['excused'] ?? 0),
-            'pct'          => round($absentPct, 1),
-            'ban_pct'      => $banPct,
-            'ban_threshold'=> $banThreshold,
-            'remaining'    => $remaining,
+            'level'          => (int)$s['risk_level'],
+            'status'         => $s['status'] === 'ineligible' ? 'prohibition'
+                                : (($s['status'] === 'eligible' && (int)$s['risk_level'] === 2) ? 'critical'
+                                : ($s['status'] === 'at_risk' ? 'attention'
+                                : ($s['status'] === 'no_data' ? 'no_data' : 'ok'))),
+            'total'          => (int)$s['completed_total'],
+            'official_total' => (int)$s['official_total'],
+            'completed_total'=> (int)$s['completed_total'],
+            'absent'         => (int)$s['absent_counted'],
+            'late'           => (int)$s['late'],
+            'present'        => (int)$s['present'],
+            'excused'        => (int)$s['excused'],
+            'pct'            => (float)$s['absent_pct'],
+            'ban_pct'        => (float)$s['ban_pct'],
+            'ban_threshold'  => (int)$s['ban_threshold'],
+            'remaining'      => (int)$s['remaining_allowed'],
+            'status_label'   => $s['status_label'],
+            'explanation'    => $s['explanation'],
         ];
     }
 

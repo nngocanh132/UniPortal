@@ -28,6 +28,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'required_credits', 'tuition_per_credit_vnd',
             'retake_allowed_max_gpa', 'plan_credits_per_semester',
             'late_submission_allowed',
+            'registration_min_credits', 'registration_max_credits',
+            'attendance_eligibility_warn_margin',
         ];
         $gpaKeys = ['gpa_warning_threshold', 'gpa_suspension_threshold', 'grad_excellent_gpa',
                     'grad_good_gpa', 'grad_average_gpa', 'grad_pass_gpa', 'retake_allowed_max_gpa'];
@@ -39,7 +41,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($k === 'plan_credits_per_semester') $v = max(3, min(30, (int)$v));
             if ($k === 'required_credits')           $v = max(1, min(300, (int)$v));
             if ($k === 'attendance_warn_pct' || $k === 'attendance_ban_pct') $v = max(0, min(100, (int)$v));
+            if ($k === 'registration_min_credits') $v = max(0, min(60, (int)$v));
+            if ($k === 'registration_max_credits') $v = max(1, min(60, (int)$v));
+            if ($k === 'attendance_eligibility_warn_margin') $v = max(0, min(50, (int)$v));
             SystemConfig::set($k, (string)$v);
+            $saved++;
+        }
+        // Keep the credit range coherent if both values were posted.
+        $cMin = SystemConfig::getInt('registration_min_credits', 14);
+        $cMax = SystemConfig::getInt('registration_max_credits', 24);
+        if ($cMax < $cMin) SystemConfig::set('registration_max_credits', (string)$cMin);
+
+        foreach (['attendance_late_absent', 'attendance_excused_absent'] as $k) {
+            SystemConfig::set($k, ($_POST[$k] ?? '0') === '1' ? '1' : '0');
             $saved++;
         }
 
@@ -398,6 +412,9 @@ $policyFields = [
     ['gpa_suspension_threshold', 'Ngưỡng nguy cơ đình chỉ',      '1.50',  '0.01'],
     ['attendance_warn_pct',      'Vắng % tối thiểu (cảnh báo)',  '15',    '1'],
     ['attendance_ban_pct',       'Vắng % cấm thi',               '20',    '1'],
+    ['attendance_eligibility_warn_margin', 'Biên cảnh báo cận ngưỡng cấm thi (%)', '5', '1'],
+    ['registration_min_credits', 'Tín chỉ tối thiểu / học kỳ',    '14',    '1'],
+    ['registration_max_credits', 'Tín chỉ tối đa / học kỳ',       '24',    '1'],
     ['grad_excellent_gpa',       'GPA Xuất sắc (≥)',              '3.60',  '0.01'],
     ['grad_good_gpa',            'GPA Giỏi (≥)',                  '3.20',  '0.01'],
     ['grad_average_gpa',         'GPA Khá (≥)',                   '2.50',  '0.01'],
@@ -426,6 +443,25 @@ $policyFields = [
                        style="width:100%;height:36px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;outline:none;" />
             </div>
             <?php endforeach; ?>
+        </div>
+
+        <div style="margin-top:20px;padding-top:16px;border-top:1px solid #eef2f7;">
+            <div style="font-size:14px;font-weight:700;color:#001634;margin-bottom:4px;">🧮 Chính sách tính vắng &amp; điều kiện dự thi</div>
+            <div style="font-size:12px;color:#64748b;margin-bottom:10px;">
+                Tỷ lệ vắng luôn tính trên <strong>tổng số buổi học chính thức</strong> của lớp (đã loại buổi hủy).
+                Buổi học tương lai và buổi chưa điểm danh không bị coi là vắng. Chỉ khi vắng <strong>vượt quá</strong>
+                ngưỡng cấm thi sinh viên mới mất điều kiện dự thi; vắng đúng bằng ngưỡng vẫn đủ điều kiện.
+            </div>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#334155;margin-bottom:8px;">
+                <input type="checkbox" name="attendance_late_absent" value="1"
+                       <?= SystemConfig::get('attendance_late_absent', '0') === '1' ? 'checked' : '' ?> />
+                Tính lượt <strong>đi muộn</strong> là vắng khi xét điều kiện dự thi
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#334155;">
+                <input type="checkbox" name="attendance_excused_absent" value="1"
+                       <?= SystemConfig::get('attendance_excused_absent', '0') === '1' ? 'checked' : '' ?> />
+                Tính lượt <strong>vắng có phép</strong> là vắng khi xét điều kiện dự thi
+            </label>
         </div>
 
         <div style="margin-top:20px;padding-top:16px;border-top:1px solid #eef2f7;">

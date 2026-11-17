@@ -24,6 +24,13 @@ USE uniportal;
 SET NAMES utf8mb4;
 
 -- ── 1. Active-semester section metadata ──────────────────────
+INSERT INTO Course (course_code, course_name, credits, department_id, description, is_active)
+SELECT 'INS3056', 'Enterprise Information Systems', 3, d.department_id,
+       'ERP, CRM and integrated business information systems.', 1
+FROM Department d
+WHERE d.department_code = 'MIS'
+  AND NOT EXISTS (SELECT 1 FROM Course WHERE course_code = 'INS3056');
+
 UPDATE ClassSection
 SET section_code = 'MIS2101-01'
 WHERE section_id = 36 AND section_code = 'MIS3101-01';

@@ -20,14 +20,11 @@ $class_code = $_SESSION['class_code'] ?? '';
 $currentSem = StudentModel::getCurrentSemester();
 $semId      = (int)($currentSem['semester_id'] ?? 0);
 
-// Get all semesters for the filter dropdown
-$pdo        = get_db();
-$allSems    = $pdo->prepare('SELECT semester_id,semester_name,academic_year FROM Semester ORDER BY start_date DESC');
-$allSems->execute();
-$semesters  = $allSems->fetchAll();
+$pdo = get_db();
 
-// Selected semester from filter (default = current)
-$selSemId = isset($_GET['sem']) ? (int)$_GET['sem'] : $semId;
+// Semester filter: 0 = show every studied semester (default).
+$semFilter = isset($_GET['sem']) ? max(0, (int)$_GET['sem']) : 0;
+$selSemId  = $semFilter ?: $semId; // semester shown in the KPI card
 
 // Cumulative data
 $cumData       = GpaModel::getCumulative($student_id);
@@ -35,8 +32,28 @@ $cumulativeGpa = $cumData['cumulative_gpa'];
 $earnedCredits = $cumData['earned_credits'];
 $classification = GpaModel::getClassification($cumulativeGpa);
 
-// GPA history for chart
-$gpaHistory = GpaModel::getGpaHistory($student_id);
+// Semesters the student actually studied (completed + current), newest first.
+$studiedStmt = $pdo->prepare(
+    "SELECT DISTINCT s.semester_id, s.semester_name, s.academic_year, s.start_date
+     FROM Semester s
+     JOIN ClassSection cs ON cs.semester_id = s.semester_id
+     JOIN Enrollment e    ON e.section_id   = cs.section_id
+     WHERE e.student_id = :sid
+       AND e.status IN ('Enrolled','Completed')
+     ORDER BY s.start_date DESC, s.semester_id DESC"
+);
+$studiedStmt->execute([':sid' => $student_id]);
+$semesterOptions = $studiedStmt->fetchAll();
+
+// Keep the current semester visible even if it has no enrollment yet.
+if ($semId && !in_array($semId, array_map('intval', array_column($semesterOptions, 'semester_id')), true)) {
+    array_unshift($semesterOptions, [
+        'semester_id'   => $semId,
+        'semester_name' => $currentSem['semester_name'] ?? 'Học kỳ hiện tại',
+        'academic_year' => $currentSem['academic_year'] ?? '',
+        'start_date'    => $currentSem['start_date'] ?? null,
+    ]);
+}
 
 // Grades for selected semester (detailed)
 function getGradesForSemester(string $student_id, int $semester_id): array {
@@ -94,19 +111,34 @@ function getGradesForSemester(string $student_id, int $semester_id): array {
     return $stmt->fetchAll();
 }
 
-$grades    = getGradesForSemester($student_id, $selSemId ?: $semId);
-$semGpa    = $selSemId ? GpaModel::getSemesterGpa($student_id, $selSemId) : null;
+$semGpa = $selSemId ? GpaModel::getSemesterGpa($student_id, $selSemId) : null;
 
-// Chart data
-$chartLabels = $chartSemGpa = $chartCumGpa = [];
-$rCred = $rPts = 0;
-foreach ($gpaHistory as $r) {
-    $yr = $r['academic_year'] ?? '';
-    $chartLabels[] = preg_replace('/^Học kỳ\s*/i','HK',$r['semester_name']??'').' ('.$yr.')';
-    $chartSemGpa[] = (float)($r['semester_gpa'] ?? 0);
-    $rCred += (int)($r['credits_this_sem'] ?? 0);
-    $rPts  += (float)($r['semester_gpa'] ?? 0) * (int)($r['credits_this_sem'] ?? 1);
-    $chartCumGpa[] = $rCred > 0 ? round($rPts/$rCred,2) : 0;
+// Academic results for every studied semester, most recent first.
+$visibleSemesters = $semFilter
+    ? array_values(array_filter($semesterOptions, fn($s) => (int)$s['semester_id'] === $semFilter))
+    : $semesterOptions;
+if ($semFilter && !$visibleSemesters) $visibleSemesters = $semesterOptions;
+
+$semesterResults = [];
+foreach ($visibleSemesters as $s) {
+    $rowSemId  = (int)$s['semester_id'];
+    $semGrades = getGradesForSemester($student_id, $rowSemId);
+    $semCredits = 0;
+    foreach ($semGrades as $g) $semCredits += (int)$g['credits'];
+    $semesterResults[] = [
+        'semester' => $s,
+        'grades'   => $semGrades,
+        'credits'  => $semCredits,
+        'gpa'      => GpaModel::getSemesterGpa($student_id, $rowSemId),
+    ];
+}
+
+$kpiSemName = $currentSem['semester_name'] ?? '—';
+foreach ($semesterOptions as $s) {
+    if ((int)$s['semester_id'] === $selSemId) {
+        $kpiSemName = trim(($s['semester_name'] ?? '') . ' ' . ($s['academic_year'] ?? ''));
+        break;
+    }
 }
 
 function h($v):string{ return htmlspecialchars((string)$v,ENT_QUOTES,'UTF-8'); }
@@ -150,7 +182,7 @@ require_once __DIR__ . '/../partials/layout.php';
     <div class="card kpi-card">
         <div class="kpi-card__header">
             <span class="kpi-card__label">GPA học kỳ <?= $selSemId && $selSemId !== $semId ? 'đã chọn' : 'hiện tại' ?></span>
-            <span class="kpi-card__badge kpi-card__badge--blue"><?= $semGpa !== null ? GpaModel::getClassification($semGpa) : '—' ?></span>
+            <span class="kpi-card__badge <?= $semGpa !== null ? 'kpi-card__badge--blue' : 'kpi-card__badge--muted' ?>"><?= $semGpa !== null ? GpaModel::getClassification($semGpa) : '—' ?></span>
         </div>
         <div class="kpi-card__value">
             <span class="kpi-card__num"><?= gf($semGpa) ?></span>
@@ -161,7 +193,7 @@ require_once __DIR__ . '/../partials/layout.php';
                 <div class="progress-bar__fill progress-bar__fill--green"
                      style="width:<?= $semGpa !== null ? round($semGpa/4*100,1) : 0 ?>%"></div>
             </div>
-            <div class="kpi-card__meta"><?= h($currentSem['semester_name'] ?? '—') ?></div>
+            <div class="kpi-card__meta"><?= h($kpiSemName) ?></div>
         </div>
     </div>
     <div class="card kpi-card">
@@ -183,28 +215,7 @@ require_once __DIR__ . '/../partials/layout.php';
     </div>
 </div>
 
-<!-- GPA Trend Chart -->
-<div class="card" style="padding:24px;">
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;">
-        <div>
-            <div style="font-size:18px;font-weight:700;color:#001634;">Diễn biến GPA qua các học kỳ</div>
-            <div style="font-size:13px;color:#44474e;margin-top:2px;">Biểu đồ theo dõi GPA học kỳ và GPA tích lũy toàn khoá</div>
-        </div>
-        <div class="chart-tabs">
-            <button class="chart-tab active" data-chart="semester">GPA học kỳ</button>
-            <button class="chart-tab" data-chart="cumulative">GPA tích lũy</button>
-        </div>
-    </div>
-    <?php if (empty($gpaHistory)): ?>
-    <div class="empty-state"><div class="empty-state__icon">📊</div><p>Chưa có dữ liệu GPA từ các học kỳ trước.</p></div>
-    <?php else: ?>
-    <div style="position:relative;height:220px;">
-        <canvas id="gpaChartCanvas" role="img" aria-label="Biểu đồ GPA"></canvas>
-    </div>
-    <?php endif; ?>
-</div>
-
-<!-- Filter ribbon + grades table -->
+<!-- Filter ribbon -->
 <div class="filter-ribbon">
     <div class="filter-ribbon__search">
         <img class="si" src="<?= $imgBase ?>icon-search.svg" alt="" />
@@ -214,9 +225,10 @@ require_once __DIR__ . '/../partials/layout.php';
         <span style="font-size:13px;font-weight:600;color:#44474e;">Học kỳ:</span>
         <form method="GET" style="display:flex;align-items:center;gap:8px;">
             <select name="sem" onchange="this.form.submit()">
-                <?php foreach ($semesters as $s): ?>
+                <option value="0" <?= $semFilter === 0 ? 'selected' : '' ?>>Tất cả học kỳ</option>
+                <?php foreach ($semesterOptions as $s): ?>
                 <option value="<?= h($s['semester_id']) ?>"
-                    <?= (int)$s['semester_id'] === ($selSemId ?: $semId) ? 'selected' : '' ?>>
+                    <?= (int)$s['semester_id'] === $semFilter ? 'selected' : '' ?>>
                     <?= h($s['semester_name']) ?> <?= h($s['academic_year']) ?>
                 </option>
                 <?php endforeach; ?>
@@ -225,80 +237,111 @@ require_once __DIR__ . '/../partials/layout.php';
     </div>
 </div>
 
-<div class="card">
-    <div class="data-table-wrap">
-        <table class="data-table" id="gradesTable">
-            <thead>
-                <tr>
-                    <th>Mã môn</th>
-                    <th>Tên môn học</th>
-                    <th>TC</th>
-                    <th>Điểm tổng kết (10)</th>
-                    <th>Điểm chữ</th>
-                    <th>Điểm hệ 4</th>
-                    <th>Giảng viên</th>
-                    <th>Trạng thái</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php if (empty($grades)): ?>
-                <tr><td colspan="8" style="text-align:center;padding:40px;color:#94a3b8;font-style:italic;">
-                    Không có dữ liệu điểm cho học kỳ này.
-                </td></tr>
-                <?php else: ?>
-                <?php foreach ($grades as $g): ?>
-                <tr>
-                    <td><span style="font-family:monospace;font-size:12px;background:#f1f5f9;padding:2px 6px;border-radius:4px;"><?= h($g['course_code']) ?></span></td>
-                    <td style="font-weight:600;color:#001634;max-width:220px;"><?= h($g['course_name']) ?></td>
-                    <td style="text-align:center;"><?= h($g['credits']) ?></td>
-                    <td style="text-align:center;font-weight:600;">
-                        <?= $g['weighted_score'] !== null ? number_format((float)$g['weighted_score'],1) : '<span style="color:#94a3b8;">—</span>' ?>
-                    </td>
-                    <td style="text-align:center;">
-                        <?php $ltr = $g['letter_grade'] ?? null; ?>
-                        <?php if ($ltr): ?>
-                        <span class="grade-badge <?= gradeBadgeClass($ltr) ?>"><?= h($ltr) ?></span>
-                        <?php else: ?>
-                        <span style="color:#94a3b8;">—</span>
-                        <?php endif; ?>
-                    </td>
-                    <td style="text-align:center;font-weight:600;"><?= $g['grade_point'] !== null ? number_format((float)$g['grade_point'],1) : '<span style="color:#94a3b8;">—</span>' ?></td>
-                    <td style="font-size:12px;color:#44474e;"><?= h($g['lecturer_name']) ?></td>
-                    <td>
-                        <?php $st = strtolower($g['enroll_status'] ?? ''); ?>
-                        <span class="status-pill status-pill--<?= $st === 'completed' ? 'complete' : ($st === 'enrolled' ? 'enrolled' : 'absent') ?>">
-                            <?= $g['enroll_status'] === 'Completed' ? 'Hoàn thành' : ($g['enroll_status'] === 'Enrolled' ? 'Đang học' : h($g['enroll_status'])) ?>
-                        </span>
-                    </td>
-                </tr>
-                <?php endforeach; ?>
-                <?php endif; ?>
-            </tbody>
-        </table>
-    </div>
+<!-- Academic results per semester, newest first -->
+<?php if (empty($semesterResults)): ?>
+<div class="card" style="padding:40px;text-align:center;color:#94a3b8;font-style:italic;">
+    Chưa có dữ liệu kết quả học tập.
 </div>
+<?php else: ?>
+<div style="display:flex;flex-direction:column;gap:16px;">
+    <?php foreach ($semesterResults as $result):
+        $semRow      = $result['semester'];
+        $isCurrent   = (int)$semRow['semester_id'] === $semId;
+        $semGrades   = $result['grades'];
+    ?>
+    <div class="card grades-section" data-semester="<?= (int)$semRow['semester_id'] ?>" style="padding:0;overflow:hidden;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:14px 18px;border-bottom:1px solid #eef2f7;background:#f8fafc;">
+            <div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:15px;font-weight:700;color:#001634;">
+                    <?= h($semRow['semester_name']) ?>
+                    <span style="font-size:12px;font-weight:600;color:#64748b;"><?= h($semRow['academic_year']) ?></span>
+                    <?php if ($isCurrent): ?>
+                    <span class="status-pill status-pill--enrolled" style="font-size:10px;">Học kỳ hiện tại</span>
+                    <?php endif; ?>
+                </div>
+                <div style="font-size:12px;color:#64748b;margin-top:2px;">
+                    <?= count($semGrades) ?> môn học · <?= (int)$result['credits'] ?> tín chỉ
+                </div>
+            </div>
+            <span style="font-size:12px;font-weight:700;color:#102b50;background:#eff6ff;padding:5px 10px;border-radius:14px;">
+                GPA học kỳ: <?= $result['gpa'] !== null ? number_format((float)$result['gpa'], 2) . ' / 4.00' : '—' ?>
+            </span>
+        </div>
+        <div class="data-table-wrap">
+            <table class="data-table grades-table">
+                <thead>
+                    <tr>
+                        <th>Mã môn</th>
+                        <th>Tên môn học</th>
+                        <th>TC</th>
+                        <th>Điểm tổng kết (10)</th>
+                        <th>Điểm chữ</th>
+                        <th>Điểm hệ 4</th>
+                        <th>Giảng viên</th>
+                        <th>Trạng thái</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if (empty($semGrades)): ?>
+                    <tr><td colspan="8" style="text-align:center;padding:40px;color:#94a3b8;font-style:italic;">
+                        Không có dữ liệu điểm cho học kỳ này.
+                    </td></tr>
+                    <?php else: ?>
+                    <?php foreach ($semGrades as $g): ?>
+                    <tr data-grade-row>
+                        <td><span style="font-family:monospace;font-size:12px;background:#f1f5f9;padding:2px 6px;border-radius:4px;"><?= h($g['course_code']) ?></span></td>
+                        <td style="font-weight:600;color:#001634;max-width:220px;"><?= h($g['course_name']) ?></td>
+                        <td style="text-align:center;"><?= h($g['credits']) ?></td>
+                        <td style="text-align:center;font-weight:600;">
+                            <?= $g['weighted_score'] !== null ? number_format((float)$g['weighted_score'],1) : '<span style="color:#94a3b8;">—</span>' ?>
+                        </td>
+                        <td style="text-align:center;">
+                            <?php $ltr = $g['letter_grade'] ?? null; ?>
+                            <?php if ($ltr): ?>
+                            <span class="grade-badge <?= gradeBadgeClass($ltr) ?>"><?= h($ltr) ?></span>
+                            <?php else: ?>
+                            <span style="color:#94a3b8;">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td style="text-align:center;font-weight:600;"><?= $g['grade_point'] !== null ? number_format((float)$g['grade_point'],1) : '<span style="color:#94a3b8;">—</span>' ?></td>
+                        <td style="font-size:12px;color:#44474e;"><?= h($g['lecturer_name']) ?></td>
+                        <td>
+                            <?php $st = strtolower($g['enroll_status'] ?? ''); ?>
+                            <span class="status-pill status-pill--<?= $st === 'completed' ? 'complete' : ($st === 'enrolled' ? 'enrolled' : 'absent') ?>">
+                                <?= $g['enroll_status'] === 'Completed' ? 'Hoàn thành' : ($g['enroll_status'] === 'Enrolled' ? 'Đang học' : h($g['enroll_status'])) ?>
+                            </span>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <?php endforeach; ?>
+</div>
+<?php endif; ?>
 
 </div></main>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"
-        crossorigin="anonymous"></script>
-<script>
-window.UNIPORTAL = {
-    chartLabels: <?= json_encode($chartLabels, JSON_UNESCAPED_UNICODE) ?>,
-    chartSemGpa: <?= json_encode($chartSemGpa) ?>,
-    chartCumGpa: <?= json_encode($chartCumGpa) ?>,
-    earnedCredits: <?= (int)$earnedCredits ?>,
-    totalCredits: 130
-};
-</script>
 <script src="../../assets/js/dashboard.js"></script>
 <script>
-// Client-side table search
-document.getElementById('gradeSearch')?.addEventListener('input', function(){
-    const q = this.value.toLowerCase();
-    document.querySelectorAll('#gradesTable tbody tr').forEach(tr => {
-        tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+// Client-side course search across every semester table
+(function () {
+    var input = document.getElementById('gradeSearch');
+    if (!input) return;
+    input.addEventListener('input', function () {
+        var q = this.value.trim().toLowerCase();
+        document.querySelectorAll('.grades-section').forEach(function (section) {
+            var visible = 0;
+            section.querySelectorAll('tr[data-grade-row]').forEach(function (tr) {
+                var show = q === '' || tr.textContent.toLowerCase().includes(q);
+                tr.style.display = show ? '' : 'none';
+                if (show) visible++;
+            });
+            section.style.display = (q === '' || visible > 0) ? '' : 'none';
+        });
     });
-});
+})();
 </script>
 </body></html>

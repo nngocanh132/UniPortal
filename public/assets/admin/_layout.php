@@ -8,7 +8,6 @@ if (!isset($pageTitle))   $pageTitle   = 'UniPortal Admin';
 if (!isset($activePage))  $activePage  = '';
 if (!isset($breadcrumb))  $breadcrumb  = 'Quản trị › Học vụ & Sinh viên';
 if (!isset($warnCount))   $warnCount   = 0;
-if (!isset($headerTitle)) $headerTitle = 'HỆ THỐNG QUẢN TRỊ ĐÀO TẠO & HỌC VỤ VNUIS';
 
 $IMG = '../img/';
 $CSS = '../css/';
@@ -30,6 +29,7 @@ $nav = [
     ['registration_periods', 'Đợt đăng ký môn học',       'db-nav-schedule.svg',       'registration_periods.php'],
     ['attendance',     'Quản lý điểm danh',              'db-nav-attendance.svg',     'attendance.php'],
     ['reports',        'Báo cáo & Thống kê',             'db-nav-grades.svg',         'reports.php'],
+    ['tuition',        'Thanh toán học phí',             'db-icon-credits.svg',       'tuition.php'],
     ['import_export',  'Import & Export',                'db-icon-credits.svg',       'import_export.php'],
     ['auditlog',       'Nhật ký hệ thống',               'db-nav-alerts.svg',         'auditlog.php'],
     ['settings',       'Cài đặt hệ thống',               'db-icon-ai.svg',            'config.php'],
@@ -37,6 +37,13 @@ $nav = [
 
 if (!function_exists('h')) {
     function h($v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+}
+
+if (isset($_GET['mark_all_notif']) && !empty($_SESSION['account_id'])) {
+    require_once dirname(__DIR__, 3) . '/src/src/services/NotificationService.php';
+    NotificationService::markAllRead((int)$_SESSION['account_id']);
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
 }
 ?>
 <!DOCTYPE html>
@@ -47,11 +54,11 @@ if (!function_exists('h')) {
     <title><?= h($pageTitle) ?> – UniPortal Admin</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="stylesheet" href="<?= $CSS ?>admin.css" />
+    <link rel="stylesheet" href="<?= $CSS ?>admin.css?v=<?= @filemtime(__DIR__ . '/../css/admin.css') ?: 0 ?>" />
     <?php if (!empty($extraCss)): ?>
-    <link rel="stylesheet" href="<?= $CSS ?><?= h($extraCss) ?>" />
+    <link rel="stylesheet" href="<?= $CSS ?><?= h($extraCss) ?>?v=<?= @filemtime(__DIR__ . '/../css/' . $extraCss) ?: 0 ?>" />
     <?php endif; ?>
-    <link rel="stylesheet" href="<?= $CSS ?>system.css" />
+    <link rel="stylesheet" href="<?= $CSS ?>system.css?v=<?= @filemtime(__DIR__ . '/../css/system.css') ?: 0 ?>" />
 </head>
 <body>
 <div class="adm-layout">
@@ -72,26 +79,25 @@ if (!function_exists('h')) {
         <?php endforeach; ?>
     </nav>
     <div class="adm-sidebar__footer">
-        <div class="adm-sidebar__online">
-            <span class="adm-sidebar__dot"></span>
-            <div class="adm-sidebar__status">
-                <strong>Trực tuyến</strong><br/>
-                Đồng bộ ĐHQGHN: <?= date('H:i') ?> Hôm nay
+        <div class="sidebar-profile">
+            <span class="sidebar-profile__avatar"><?= h($adminIni) ?></span>
+            <div class="sidebar-profile__text">
+                <div class="sidebar-profile__name">Quản trị viên</div>
+                <div class="sidebar-profile__role">Phòng Đào tạo</div>
             </div>
+            <a href="?logout=1" class="sidebar-profile__logout" title="Đăng xuất" aria-label="Đăng xuất">
+                <img src="<?= $IMG ?>db-icon-logout.svg" alt="" />
+            </a>
         </div>
-        <a href="?logout=1" class="adm-sidebar__logout">
-            <img src="<?= $IMG ?>db-icon-logout.svg" alt="" />
-            Đăng xuất
-        </a>
     </div>
 </aside>
 
 <!-- ═══════════ HEADER ════════════════════════════════════ -->
 <header class="adm-header">
-    <div style="display:flex;align-items:center;gap:16px;">
+    <div style="display:flex;align-items:center;gap:16px;min-width:0;">
         <button class="adm-hamburger" id="admHam"><span></span><span></span><span></span></button>
         <div class="adm-header__left">
-            <div class="adm-header__title"><?= h($headerTitle) ?></div>
+            <div class="adm-header__title"><?= h($pageTitle) ?></div>
             <div class="adm-header__breadcrumb"><?= h($breadcrumb) ?></div>
         </div>
     </div>
@@ -105,42 +111,45 @@ if (!function_exists('h')) {
         $notifCount = NotificationService::unreadCount((int)($_SESSION['account_id'] ?? 0));
         $notifItems = NotificationService::getRecent((int)($_SESSION['account_id'] ?? 0), 5);
         $bellBadge  = max((int)($warnCount ?? 0), $notifCount);
-        if (isset($_GET['mark_all_notif'])) {
-            NotificationService::markAllRead((int)($_SESSION['account_id'] ?? 0));
-            header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
-            exit;
-        }
         ?>
-        <div style="position:relative;">
-        <button class="adm-header__bell" id="admBell"
-                onclick="var d=document.getElementById('admNotifDrop');d.style.display=d.style.display==='none'?'block':'none';">
+        <div id="admNotifWrap">
+        <button class="adm-header__bell" id="admBell" aria-label="Thông báo" aria-expanded="false"
+                onclick="this.setAttribute('aria-expanded', document.getElementById('admNotifDrop').classList.toggle('show'));">
             <img src="<?= $IMG ?>db-icon-bell.svg" alt="" />
             <?php if ($bellBadge > 0): ?>
             <span class="hbadge"><?= min($bellBadge, 9) ?></span>
             <?php endif; ?>
         </button>
-        <div id="admNotifDrop" style="display:none;position:absolute;right:0;top:44px;width:300px;background:#fff;
-             border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.15);z-index:999;overflow:hidden;">
-            <div style="padding:10px 14px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;">
-                <span style="font-weight:700;font-size:13px;">Thông báo</span>
-                <?php if ($bellBadge > 0): ?>
-                <a href="?mark_all_notif=1" style="font-size:11px;color:#3b82f6;text-decoration:none;">Đánh dấu đã đọc</a>
+        <div id="admNotifDrop" class="notif-panel">
+            <div class="notif-panel__head">
+                <span class="notif-panel__title">Thông báo</span>
+                <?php if ($notifCount > 0): ?>
+                <a href="?mark_all_notif=1" class="notif-panel__action">Đánh dấu đã đọc</a>
                 <?php endif; ?>
             </div>
             <?php if (empty($notifItems) && !$warnCount): ?>
-            <div style="padding:20px;text-align:center;color:#94a3b8;font-size:12px;">Không có thông báo.</div>
+            <div class="notif-panel__empty">Không có thông báo.</div>
             <?php else: ?>
-            <div style="max-height:240px;overflow-y:auto;">
+            <div class="notif-panel__list">
+                <?php if ($warnCount): ?>
+                <a class="notif-item notif-item--unread" href="alerts.php">
+                    <div class="notif-item__title"><?= (int)$warnCount ?> cảnh báo học vụ đang hoạt động</div>
+                    <div class="notif-item__time">Cần xem xét</div>
+                </a>
+                <?php endif; ?>
                 <?php foreach ($notifItems as $n): ?>
-                <div style="padding:10px 14px;border-bottom:1px solid #f8fafc;background:<?= !$n['is_read']?'#f8fbff':'#fff' ?>;">
-                    <div style="font-size:12px;font-weight:<?= !$n['is_read']?'700':'400' ?>;color:#001634;"><?= htmlspecialchars($n['title']) ?></div>
-                    <div style="font-size:10px;color:#94a3b8;"><?= date('d/m H:i', strtotime($n['created_at'])) ?></div>
+                <div class="notif-item<?= !$n['is_read'] ? ' notif-item--unread' : '' ?>">
+                    <div class="notif-item__title"><?= htmlspecialchars($n['title']) ?></div>
+                    <?php if ($n['body']): ?>
+                    <div class="notif-item__body"><?= htmlspecialchars(mb_strimwidth($n['body'], 0, 60, '…')) ?></div>
+                    <?php endif; ?>
+                    <div class="notif-item__time"><?= date('d/m H:i', strtotime($n['created_at'])) ?></div>
                 </div>
                 <?php endforeach; ?>
             </div>
             <?php endif; ?>
-            <div style="padding:8px;text-align:center;border-top:1px solid #f1f5f9;">
-                <a href="alerts.php" style="font-size:11px;color:#3b82f6;text-decoration:none;">Xem cảnh báo học vụ →</a>
+            <div class="notif-panel__footer">
+                <a href="alerts.php">Xem cảnh báo học vụ →</a>
             </div>
         </div>
         </div>
@@ -150,10 +159,32 @@ if (!function_exists('h')) {
                 <div class="hname">Quản trị viên Hệ thống</div>
                 <div class="hrole">Phòng Đào tạo</div>
             </div>
-            <img src="<?= $IMG ?>db-icon-caret.svg" alt="" style="width:7px;height:4px;opacity:.5;margin-left:2px;" />
+            <img src="<?= $IMG ?>db-icon-caret.svg" alt="" class="hcaret" />
         </button>
     </div>
 </header>
+<script>
+(function () {
+    document.addEventListener('click', function (e) {
+        var drop = document.getElementById('admNotifDrop');
+        var wrap = document.getElementById('admNotifWrap');
+        if (!drop || !wrap || !drop.classList.contains('show')) return;
+        if (!wrap.contains(e.target)) {
+            drop.classList.remove('show');
+            var bell = document.getElementById('admBell');
+            if (bell) bell.setAttribute('aria-expanded', 'false');
+        }
+    });
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Escape') return;
+        var drop = document.getElementById('admNotifDrop');
+        if (!drop || !drop.classList.contains('show')) return;
+        drop.classList.remove('show');
+        var bell = document.getElementById('admBell');
+        if (bell) { bell.setAttribute('aria-expanded', 'false'); bell.focus(); }
+    });
+})();
+</script>
 
 <!-- ═══════════ MAIN CONTENT ══════════════════════════════ -->
 <main class="adm-main">

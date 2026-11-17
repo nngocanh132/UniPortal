@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS major (
     KEY idx_major_department (department_id),
     CONSTRAINT fk_major_department FOREIGN KEY (department_id)
         REFERENCES department (department_id) ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ── 3. Students and curricula reference a major ──────────────
 ALTER TABLE student
@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS registrationperiod (
     CONSTRAINT fk_period_created_by FOREIGN KEY (created_by)
         REFERENCES account (account_id) ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT ck_period_dates CHECK (end_at > start_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS registrationperiodmajor (
     period_id INT UNSIGNED NOT NULL,
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS registrationperiodmajor (
         REFERENCES registrationperiod (period_id) ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT fk_rpm_major FOREIGN KEY (major_id)
         REFERENCES major (major_id) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS registrationperiodsection (
     period_id  INT UNSIGNED NOT NULL,
@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS registrationperiodsection (
         REFERENCES registrationperiod (period_id) ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT fk_rps_section FOREIGN KEY (section_id)
         REFERENCES classsection (section_id) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ── 7. Sample catalog: additional academic areas ────────────
 INSERT INTO department (department_name, department_code, is_active) VALUES
@@ -159,7 +159,7 @@ CREATE TEMPORARY TABLE tmp_course_seed (
     credits TINYINT UNSIGNED NOT NULL,
     dept_code VARCHAR(20) NOT NULL,
     description TEXT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 INSERT INTO tmp_course_seed VALUES
     ('GE1001','Academic Skills and Learning Methods',2,'GE','Study skills, academic integrity and learning planning.'),
@@ -287,7 +287,7 @@ CREATE TEMPORARY TABLE tmp_section_seed (
     start_time   TIME NOT NULL,
     end_time     TIME NOT NULL,
     schedule_txt VARCHAR(255) NOT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 INSERT INTO tmp_section_seed VALUES
     ('GE1002-01','GE1002','Học kỳ 1','2026-2027',8,'A1.101',48,64,'4','07:30:00','09:00:00','Thứ 4 07:30-09:00'),

@@ -16,7 +16,7 @@ $assetBase  = $assetBase  ?? '../';        // relative to the page file
 
 $studentName = $_SESSION['full_name']  ?? 'Sinh viên';
 $studentId   = $_SESSION['student_id'] ?? '';
-$warningCnt  = 0; // pages that need this can override before including
+$warningCnt  = $warningCnt ?? 0; // pages that need this can set it before including
 
 // Nav items: [id, label, icon-file, href]
 $navItems = [
@@ -31,6 +31,34 @@ $navItems = [
     ['schedule',      'Thời khóa biểu',               'db-nav-schedule.svg',    'schedule.php'],
     ['profile',       'Hồ sơ cá nhân',                'db-nav-profile.svg',     'profile.php'],
 ];
+
+// Handle mark-all-notifications-read before any output so the redirect works
+if (isset($_GET['mark_all_notif']) && !empty($_SESSION['account_id'])) {
+    require_once ($root ?? dirname(__DIR__, 3)) . '/src/src/services/NotificationService.php';
+    NotificationService::markAllRead((int)$_SESSION['account_id']);
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+
+// Open one notification: mark it read, then continue to its own destination.
+if (isset($_GET['read_notif']) && !empty($_SESSION['account_id'])) {
+    require_once ($root ?? dirname(__DIR__, 3)) . '/src/src/services/NotificationService.php';
+    $accountId = (int)$_SESSION['account_id'];
+    $notifId   = filter_var($_GET['read_notif'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+    $note      = $notifId === false ? false : NotificationService::getForAccount($notifId, $accountId);
+    if ($note) {
+        NotificationService::markRead($notifId, $accountId);
+        $target = (string)$note['link'];
+        // Only same-site links are followed; anything else falls back to the current page.
+        if (preg_match('~\A/UniPortal/[A-Za-z0-9._/?=&%#-]*\z~', $target) === 1) {
+            header('Location: ' . $target, true, 303);
+            exit;
+        }
+    }
+    $back = strtok($_SERVER['REQUEST_URI'], '?');
+    header('Location: ' . ($back ?: 'dashboard.php'), true, 303);
+    exit;
+}
 ?>
 <!DOCTYPE html>
 <html lang="vi">
@@ -40,11 +68,11 @@ $navItems = [
     <title><?= htmlspecialchars($pageTitle, ENT_QUOTES, 'UTF-8') ?> – UniPortal</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="stylesheet" href="<?= $assetBase ?>css/dashboard.css" />
+    <link rel="stylesheet" href="<?= $assetBase ?>css/dashboard.css?v=<?= @filemtime(__DIR__ . '/../css/dashboard.css') ?: 0 ?>" />
     <?php if (!empty($extraCss)): ?>
-    <link rel="stylesheet" href="<?= $assetBase ?>css/<?= htmlspecialchars($extraCss) ?>" />
+    <link rel="stylesheet" href="<?= $assetBase ?>css/<?= htmlspecialchars($extraCss) ?>?v=<?= @filemtime(__DIR__ . '/../css/' . $extraCss) ?: 0 ?>" />
     <?php endif; ?>
-    <link rel="stylesheet" href="<?= $assetBase ?>css/system.css" />
+    <link rel="stylesheet" href="<?= $assetBase ?>css/system.css?v=<?= @filemtime(__DIR__ . '/../css/system.css') ?: 0 ?>" />
 </head>
 <body>
 <div class="db-layout">
@@ -85,10 +113,14 @@ $navItems = [
 
 <!-- HEADER -->
 <header class="db-header" role="banner">
-    <div style="display:flex;align-items:center;gap:12px;">
+    <div style="display:flex;align-items:center;gap:16px;min-width:0;">
         <button class="db-hamburger" id="hamburger" aria-label="Mở menu" aria-expanded="false">
             <span></span><span></span><span></span>
         </button>
+        <div class="db-header__context">
+            <div class="db-header__context-title"><?= htmlspecialchars($pageTitle, ENT_QUOTES, 'UTF-8') ?></div>
+            <div class="db-header__context-sub">Cổng Sinh viên</div>
+        </div>
         <div class="db-header__search">
             <img class="search-icon" src="<?= $imgBase ?>icon-search.svg" alt="" aria-hidden="true" />
             <input type="search" placeholder="Tìm kiếm môn học, thông báo..." aria-label="Tìm kiếm" />
@@ -106,46 +138,48 @@ $navItems = [
         }
         $bellCount = max($warningCnt, $notifCount);
         ?>
-        <div style="position:relative;" id="notifDropContainer">
-        <button class="db-header__bell" id="notifBell" aria-label="Thông báo"
-                onclick="document.getElementById('notifDrop').classList.toggle('show')">
+        <div id="notifDropContainer">
+        <button class="db-header__bell" id="notifBell" aria-label="Thông báo" aria-expanded="false"
+                onclick="this.setAttribute('aria-expanded', document.getElementById('notifDrop').classList.toggle('show'));">
             <img src="<?= $imgBase ?>db-icon-bell.svg" alt="" />
             <?php if ($bellCount > 0): ?>
             <span class="badge" aria-hidden="true"><?= min($bellCount, 9) ?><?= $bellCount > 9 ? '+' : '' ?></span>
             <?php endif; ?>
         </button>
         <!-- Notification dropdown -->
-        <div id="notifDrop" style="display:none;position:absolute;right:0;top:44px;width:320px;background:#fff;
-             border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.15);z-index:500;overflow:hidden;">
-            <div style="padding:12px 16px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;align-items:center;">
-                <span style="font-weight:700;font-size:14px;color:#001634;">Thông báo</span>
-                <?php if ($bellCount > 0): ?>
-                <a href="?mark_all_notif=1" style="font-size:12px;color:#3b82f6;text-decoration:none;">Đánh dấu tất cả đã đọc</a>
+        <div id="notifDrop" class="notif-panel">
+            <div class="notif-panel__head">
+                <span class="notif-panel__title">Thông báo</span>
+                <?php if ($notifCount > 0): ?>
+                <a href="?mark_all_notif=1" class="notif-panel__action">Đánh dấu tất cả đã đọc</a>
                 <?php endif; ?>
             </div>
             <?php if (empty($notifItems) && $warningCnt === 0): ?>
-            <div style="padding:24px;text-align:center;color:#94a3b8;font-size:13px;">Không có thông báo mới.</div>
+            <div class="notif-panel__empty">Không có thông báo mới.</div>
             <?php else: ?>
-            <div style="max-height:280px;overflow-y:auto;">
-                <?php foreach ($notifItems as $n):
-                    $typeIco = ['Warning'=>'⚠️','Assignment'=>'📋','Grade'=>'📊','Attendance'=>'📅','Registration'=>'📝','Payment'=>'💰','System'=>'🔔'][$n['type']] ?? '🔔';
-                ?>
-                <div style="padding:12px 16px;border-bottom:1px solid #f8fafc;background:<?= !$n['is_read'] ? '#f8fbff' : '#fff' ?>;">
-                    <div style="font-size:13px;font-weight:<?= !$n['is_read'] ? '700' : '400' ?>;color:#001634;">
-                        <?= $typeIco ?> <?= htmlspecialchars($n['title']) ?>
-                    </div>
+            <div class="notif-panel__list">
+                <?php if ($warningCnt > 0): ?>
+                <a class="notif-item notif-item--unread" href="alerts.php">
+                    <div class="notif-item__title"><?= (int)$warningCnt ?> cảnh báo học tập đang hoạt động</div>
+                    <div class="notif-item__time">Xem chi tiết</div>
+                </a>
+                <?php endif; ?>
+                <?php foreach ($notifItems as $n): ?>
+                <a class="notif-item<?= !$n['is_read'] ? ' notif-item--unread' : '' ?>"
+                   href="?read_notif=<?= (int)$n['notification_id'] ?>">
+                    <div class="notif-item__title"><?= htmlspecialchars($n['title']) ?></div>
                     <?php if ($n['body']): ?>
-                    <div style="font-size:11px;color:#64748b;margin-top:3px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">
+                    <div class="notif-item__body">
                         <?= htmlspecialchars(mb_strimwidth($n['body'], 0, 60, '…')) ?>
                     </div>
                     <?php endif; ?>
-                    <div style="font-size:10px;color:#94a3b8;margin-top:3px;"><?= date('d/m/Y H:i', strtotime($n['created_at'])) ?></div>
-                </div>
+                    <div class="notif-item__time"><?= date('d/m/Y H:i', strtotime($n['created_at'])) ?></div>
+                </a>
                 <?php endforeach; ?>
             </div>
             <?php endif; ?>
-            <div style="padding:10px 16px;text-align:center;border-top:1px solid #f1f5f9;">
-                <a href="alerts.php" style="font-size:12px;color:#3b82f6;text-decoration:none;">Xem tất cả cảnh báo →</a>
+            <div class="notif-panel__footer">
+                <a href="alerts.php">Xem cảnh báo học tập →</a>
             </div>
         </div>
         </div>
@@ -159,15 +193,28 @@ $navItems = [
         </button>
     </div>
 </header>
-<?php
-// Handle mark-all-notifications-read
-if (isset($_GET['mark_all_notif']) && !empty($_SESSION['account_id'])) {
-    require_once ($root ?? dirname(__DIR__, 3)) . '/src/src/services/NotificationService.php';
-    NotificationService::markAllRead((int)$_SESSION['account_id']);
-    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
-    exit;
-}
-?>
+<script>
+(function () {
+    document.addEventListener('click', function (e) {
+        var drop = document.getElementById('notifDrop');
+        var box  = document.getElementById('notifDropContainer');
+        if (!drop || !box || !drop.classList.contains('show')) return;
+        if (!box.contains(e.target)) {
+            drop.classList.remove('show');
+            var bell = document.getElementById('notifBell');
+            if (bell) bell.setAttribute('aria-expanded', 'false');
+        }
+    });
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Escape') return;
+        var drop = document.getElementById('notifDrop');
+        if (!drop || !drop.classList.contains('show')) return;
+        drop.classList.remove('show');
+        var bell = document.getElementById('notifBell');
+        if (bell) { bell.setAttribute('aria-expanded', 'false'); bell.focus(); }
+    });
+})();
+</script>
 
 <!-- MAIN CONTENT WRAPPER -->
 <main class="db-main" id="main-content">

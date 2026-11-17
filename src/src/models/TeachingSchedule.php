@@ -27,6 +27,34 @@ class TeachingSchedule {
         1 => 'T2', 2 => 'T3', 3 => 'T4', 4 => 'T5', 5 => 'T6', 6 => 'T7', 7 => 'CN',
     ];
 
+    /** Default number of class sessions per course credit. */
+    public const SESSIONS_PER_CREDIT = 5;
+    public const MAX_SESSIONS = 60;
+
+    /** 2 credits → 10 sessions, 3 credits → 15 sessions, … */
+    public static function expectedSessionsForCredits(int $credits): int {
+        return max(1, $credits * self::SESSIONS_PER_CREDIT);
+    }
+
+    /** Effective expected count for a saved schedule (admin override wins). */
+    public static function expectedSessions(array $schedule): int {
+        $expected = (int)($schedule['expected_sessions'] ?? 0);
+        if ($expected > 0) return $expected;
+        $pdo = get_db();
+        $stmt = $pdo->prepare(
+            'SELECT c.credits, c.default_sessions
+             FROM ClassSection cs
+             JOIN Course c ON c.course_id = cs.course_id
+             WHERE cs.section_id = :sid LIMIT 1'
+        );
+        $stmt->execute([':sid' => (int)($schedule['section_id'] ?? 0)]);
+        $row = $stmt->fetch();
+        if ($row && (int)($row['default_sessions'] ?? 0) > 0) {
+            return min(self::MAX_SESSIONS, (int)$row['default_sessions']);
+        }
+        return self::expectedSessionsForCredits((int)($row['credits'] ?? 0));
+    }
+
     // ─────────────────────────────────────────────────────────
     // Reference data
     // ─────────────────────────────────────────────────────────
@@ -42,8 +70,8 @@ class TeachingSchedule {
     public static function getSections(int $semesterId, ?int $courseId = null): array {
         $pdo = get_db();
         $sql = 'SELECT cs.section_id, cs.section_code, cs.course_id, cs.semester_id,
-                       cs.lecturer_id, cs.room, cs.schedule, cs.capacity,
-                       c.course_code, c.course_name, c.department_id,
+                       cs.lecturer_id, cs.room, cs.schedule, cs.capacity, cs.study_days, cs.start_time, cs.end_time,
+                       c.course_code, c.course_name, c.credits, c.department_id,
                        d.department_code, d.department_name,
                        l.full_name AS lecturer_name, l.email AS lecturer_email,
                        sem.semester_name, sem.academic_year,
@@ -53,7 +81,8 @@ class TeachingSchedule {
                            AND e.status IN (\'Enrolled\',\'Completed\')) AS enrolled_count,
                        ts.schedule_id, ts.day_of_week, ts.start_time AS schedule_start,
                        ts.end_time AS schedule_end, ts.room AS schedule_room,
-                       ts.effective_start, ts.effective_end, ts.status AS schedule_status
+                       ts.effective_start, ts.effective_end, ts.expected_sessions,
+                       ts.status AS schedule_status
                 FROM ClassSection cs
                 JOIN Course c ON c.course_id = cs.course_id
                 JOIN Semester sem ON sem.semester_id = cs.semester_id
@@ -101,11 +130,13 @@ class TeachingSchedule {
     public static function getSchedules(?int $semesterId = null, ?int $courseId = null, ?int $lecturerId = null): array {
         $pdo = get_db();
         $sql = 'SELECT ts.*, cs.section_code, cs.course_id, cs.semester_id AS section_semester,
-                       c.course_code, c.course_name,
+                       c.course_code, c.course_name, c.credits,
                        d.department_code, d.department_name,
                        sem.semester_name, sem.academic_year, sem.start_date AS sem_start, sem.end_date AS sem_end,
                        l.full_name AS lecturer_name,
                        (SELECT COUNT(*) FROM AttendanceSession ats WHERE ats.schedule_id = ts.schedule_id) AS session_count,
+                       (SELECT COUNT(*) FROM AttendanceSession ats4
+                         WHERE ats4.section_id = ts.section_id AND ats4.session_type = \'Regular\') AS generated_count,
                        (SELECT COUNT(*) FROM AttendanceSession ats2
                          WHERE ats2.schedule_id = ts.schedule_id AND ats2.session_date >= CURDATE()
                            AND ats2.status = \'Scheduled\') AS upcoming_count,
@@ -158,11 +189,12 @@ class TeachingSchedule {
         $room = trim((string)($in['room'] ?? ''));
         $effStart = trim((string)($in['effective_start'] ?? ''));
         $effEnd = trim((string)($in['effective_end'] ?? ''));
+        $expectedIn = (int)($in['expected_sessions'] ?? 0);
 
         if ($sectionId <= 0) return ['ok' => false, 'message' => 'Vui lòng chọn lớp học phần.'];
         if ($lecturerId <= 0) return ['ok' => false, 'message' => 'Vui lòng chọn giảng viên phụ trách.'];
         if ($day < 1 || $day > 7) return ['ok' => false, 'message' => 'Ngày dạy không hợp lệ.'];
-        if (!preg_match('/^\d{2}:\d{2}(:\d{2})?$/', $start) || !preg_match('/^\d{2}:\d{2}(:\d{2})?$/', $end)) {
+        if (!preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/', $start) || !preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/', $end)) {
             return ['ok' => false, 'message' => 'Giờ bắt đầu/kết thúc không hợp lệ.'];
         }
         if (strtotime($end) <= strtotime($start)) {
@@ -174,14 +206,25 @@ class TeachingSchedule {
         if ($effEnd < $effStart) {
             return ['ok' => false, 'message' => 'Ngày kết thúc phải sau hoặc bằng ngày bắt đầu.'];
         }
-        $room = substr($room, 0, 30);
+        if (date('Y-m-d', strtotime($effStart)) !== $effStart || date('Y-m-d', strtotime($effEnd)) !== $effEnd) {
+            return ['ok' => false, 'message' => 'Ngày bắt đầu/kết thúc không tồn tại.'];
+        }
+        if ($room === '' || mb_strlen($room) > 30) {
+            return ['ok' => false, 'message' => 'Vui lòng nhập phòng học (tối đa 30 ký tự).'];
+        }
+        if (isset($in['expected_sessions']) && $in['expected_sessions'] !== ''
+            && filter_var($in['expected_sessions'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => self::MAX_SESSIONS]]) === false) {
+            return ['ok' => false, 'message' => 'Số buổi dự kiến phải là số nguyên từ 1 đến ' . self::MAX_SESSIONS . '.'];
+        }
         $start = strlen($start) === 5 ? $start . ':00' : $start;
         $end = strlen($end) === 5 ? $end . ':00' : $end;
 
         $secStmt = $pdo->prepare(
             'SELECT cs.section_id, cs.course_id, cs.semester_id, cs.lecturer_id,
-                    cs.section_code, sem.start_date, sem.end_date
+                    cs.section_code, c.credits, c.default_sessions, c.course_code, c.course_name,
+                    sem.start_date, sem.end_date
              FROM ClassSection cs
+             JOIN Course c ON c.course_id = cs.course_id
              JOIN Semester sem ON sem.semester_id = cs.semester_id
              WHERE cs.section_id = :sid LIMIT 1'
         );
@@ -200,11 +243,60 @@ class TeachingSchedule {
         $lecturer = $lecStmt->fetch();
         if (!$lecturer) return ['ok' => false, 'message' => 'Giảng viên không tồn tại.'];
 
-        try {
-            $pdo->beginTransaction();
+        // Credit rule: 2 credits → 10 sessions, 3 credits → 15 sessions.
+        // Admin may override the count for exceptional cases.
+        $credits = (int)$section['credits'];
+        $creditDefault = (int)($section['default_sessions'] ?? 0) > 0
+            ? min(self::MAX_SESSIONS, (int)$section['default_sessions'])
+            : self::expectedSessionsForCredits($credits);
+        $expected = $expectedIn > 0 ? $expectedIn : $creditDefault;
+        if ($expected > self::MAX_SESSIONS) {
+            return ['ok' => false, 'message' => 'Số buổi dự kiến tối đa là ' . self::MAX_SESSIONS . ' buổi.'];
+        }
 
-            // Admin's schedule form is also the authoritative lecturer assignment.
-            $oldLecturer = (int)$section['lecturer_id'];
+        // The semester calendar must contain enough matching weekdays.
+        $candidate = [
+            'effective_start' => $effStart,
+            'effective_end'   => $effEnd,
+            'day_of_week'     => $day,
+        ];
+        $matchingDates = self::targetDates($candidate);
+        if (count($matchingDates) < $expected) {
+            $message = 'Không đủ ngày học: khoảng ' .
+                date('d/m/Y', strtotime($effStart)) . ' – ' . date('d/m/Y', strtotime($effEnd)) .
+                ' chỉ có ' . count($matchingDates) . ' ngày ' .
+                (self::DAYS[$day] ?? '') . ', nhưng cần ' . $expected . ' buổi. ' .
+                'Vui lòng mở rộng khoảng ngày hoặc giảm số buổi dự kiến.';
+
+            AcademicAlertService::writeAuditLog(
+                $pdo, $adminAccountId, 'SCHEDULE_INSUFFICIENT_DATES', 'TeachingSchedule', (string)$sectionId,
+                null,
+                json_encode([
+                    'course' => $section['course_code'] ?? null,
+                    'section' => $section['section_code'] ?? null,
+                    'day_of_week' => $day,
+                    'available_dates' => count($matchingDates),
+                    'expected_sessions' => $expected,
+                ], JSON_UNESCAPED_UNICODE)
+            );
+            self::notifyAdmins(
+                'Không đủ ngày để xếp lịch giảng dạy',
+                ($section['course_code'] ?? '') . ' – ' . ($section['section_code'] ?? '') . ': ' .
+                    $message,
+                '/UniPortal/public/assets/admin/schedule.php'
+            );
+
+            return ['ok' => false, 'message' => $message];
+        }
+
+        $ownTx = !$pdo->inTransaction();
+        try {
+            if ($ownTx) $pdo->beginTransaction();
+            else $pdo->exec('SAVEPOINT teaching_schedule_save');
+
+            $lock = $pdo->prepare('SELECT lecturer_id FROM ClassSection WHERE section_id = ? FOR UPDATE');
+            $lock->execute([$sectionId]);
+            $oldLecturer = (int)$lock->fetchColumn();
             if ($oldLecturer !== $lecturerId) {
                 $pdo->prepare('UPDATE ClassSection SET lecturer_id = :lid WHERE section_id = :sid')
                     ->execute([':lid' => $lecturerId, ':sid' => $sectionId]);
@@ -221,12 +313,14 @@ class TeachingSchedule {
                     'UPDATE TeachingSchedule
                      SET semester_id = :sem, lecturer_id = :lid, day_of_week = :dow,
                          start_time = :st, end_time = :en, room = :room,
-                         effective_start = :es, effective_end = :ee, status = \'Active\'
+                         effective_start = :es, effective_end = :ee,
+                         expected_sessions = :exp, status = \'Active\'
                      WHERE schedule_id = :id'
                 )->execute([
                     ':sem' => (int)$section['semester_id'], ':lid' => $lecturerId, ':dow' => $day,
                     ':st' => $start, ':en' => $end, ':room' => ($room === '' ? null : $room),
-                    ':es' => $effStart, ':ee' => $effEnd, ':id' => (int)$existing['schedule_id'],
+                    ':es' => $effStart, ':ee' => $effEnd, ':exp' => $expected,
+                    ':id' => (int)$existing['schedule_id'],
                 ]);
                 $scheduleId = (int)$existing['schedule_id'];
                 $action = 'UPDATE_SCHEDULE';
@@ -234,13 +328,13 @@ class TeachingSchedule {
                 $pdo->prepare(
                     'INSERT INTO TeachingSchedule
                         (section_id, semester_id, lecturer_id, day_of_week, start_time, end_time,
-                         room, effective_start, effective_end, status, created_by)
-                     VALUES (:sid, :sem, :lid, :dow, :st, :en, :room, :es, :ee, \'Active\', :by)'
+                         room, effective_start, effective_end, expected_sessions, status, created_by)
+                     VALUES (:sid, :sem, :lid, :dow, :st, :en, :room, :es, :ee, :exp, \'Active\', :by)'
                 )->execute([
                     ':sid' => $sectionId, ':sem' => (int)$section['semester_id'], ':lid' => $lecturerId,
                     ':dow' => $day, ':st' => $start, ':en' => $end,
                     ':room' => ($room === '' ? null : $room), ':es' => $effStart, ':ee' => $effEnd,
-                    ':by' => $adminAccountId,
+                    ':exp' => $expected, ':by' => $adminAccountId,
                 ]);
                 $scheduleId = (int)$pdo->lastInsertId();
                 $action = 'CREATE_SCHEDULE';
@@ -248,6 +342,11 @@ class TeachingSchedule {
 
             $schedule = self::getScheduleBySection($sectionId);
             $result = self::syncSessions($schedule);
+            require_once __DIR__ . '/../services/RegistrationService.php';
+            $pdo->prepare(
+                'UPDATE ClassSection SET study_days = ?, start_time = ?, end_time = ?, room = ?, schedule = ? WHERE section_id = ?'
+            )->execute([(string)$day, $start, $end, $room,
+                RegistrationService::scheduleText([$day], $start, $end), $sectionId]);
 
             AcademicAlertService::writeAuditLog(
                 $pdo, $adminAccountId, $action, 'TeachingSchedule', (string)$scheduleId,
@@ -261,121 +360,154 @@ class TeachingSchedule {
                     'room' => $room,
                     'effective_start' => $effStart,
                     'effective_end' => $effEnd,
+                    'credits' => $credits,
+                    'expected_sessions' => $expected,
                     'generated' => $result['inserted'],
                     'updated' => $result['updated'],
                     'removed' => $result['removed'],
                 ], JSON_UNESCAPED_UNICODE)
             );
 
-            $pdo->commit();
+            if ($ownTx) $pdo->commit();
+            else $pdo->exec('RELEASE SAVEPOINT teaching_schedule_save');
 
             return [
                 'ok' => true,
-                'message' => 'Đã lưu lịch giảng dạy: tạo mới ' . $result['inserted'] .
+                'message' => 'Đã lưu lịch giảng dạy (' . $credits . ' tín chỉ → ' . $expected .
+                    ' buổi): tạo mới ' . $result['inserted'] .
                     ' buổi, cập nhật ' . $result['updated'] .
-                    ($result['removed'] ? ', gỡ ' . $result['removed'] . ' buổi chưa diễn ra' : '') . '.',
+                    ($result['removed'] ? ', gỡ ' . $result['removed'] . ' buổi chưa diễn ra' : '') .
+                    '. Tổng số buổi chính thức: ' . $result['total'] . '/' . $expected . '.',
                 'schedule_id' => $scheduleId,
                 'sessions' => $result,
             ];
         } catch (Throwable $e) {
-            if ($pdo->inTransaction()) $pdo->rollBack();
+            if ($ownTx && $pdo->inTransaction()) $pdo->rollBack();
+            elseif ($pdo->inTransaction()) $pdo->exec('ROLLBACK TO SAVEPOINT teaching_schedule_save');
             return ['ok' => false, 'message' => 'Không thể lưu lịch: ' . $e->getMessage()];
         }
     }
 
-    /**
-     * Generate missing sessions for every matching weekday in the effective
-     * range. Future generated sessions that no longer match the new weekly
-     * pattern are removed only when they have no attendance and no requests.
-     * Past sessions and any session with attendance are never touched.
-     */
     public static function syncSessions(array $schedule): array {
         $pdo = get_db();
-        $dates = self::targetDates($schedule);
-        $dateSet = array_fill_keys($dates, true);
-        $start = strlen($schedule['start_time']) === 5 ? $schedule['start_time'] . ':00' : $schedule['start_time'];
-        $end = strlen($schedule['end_time']) === 5 ? $schedule['end_time'] . ':00' : $schedule['end_time'];
-        $startHm = substr($start, 0, 5);
-
-        $find = $pdo->prepare(
-            'SELECT session_id, schedule_id, status, session_date, start_time
-             FROM AttendanceSession
-             WHERE section_id = :sid AND session_date = :d AND start_time = :st LIMIT 1'
-        );
-        $attCount = $pdo->prepare('SELECT COUNT(*) FROM Attendance WHERE session_id = :sid');
-        $reqCount = $pdo->prepare('SELECT COUNT(*) FROM ScheduleChangeRequest WHERE session_id = :sid');
-        $insert = $pdo->prepare(
-            'INSERT INTO AttendanceSession
-                (section_id, schedule_id, lecturer_id, session_date, start_time, end_time,
-                 room, topic, session_type, status)
-             VALUES (:sid, :tsid, :lid, :d, :st, :en, :room, NULL, \'Regular\', \'Scheduled\')'
-        );
-        $updateMeta = $pdo->prepare(
-            'UPDATE AttendanceSession
-             SET schedule_id = :tsid, lecturer_id = :lid, room = :room
-             WHERE session_id = :sid'
-        );
-
-        $inserted = 0; $updated = 0;
-        $today = date('Y-m-d');
-
-        foreach ($dates as $date) {
-            $find->execute([':sid' => (int)$schedule['section_id'], ':d' => $date, ':st' => $start]);
-            $row = $find->fetch();
-
-            if ($row) {
-                $attCount->execute([':sid' => (int)$row['session_id']]);
-                $hasAtt = (int)$attCount->fetchColumn() > 0;
-                // Update schedule metadata only for sessions that have no
-                // recorded attendance (past records stay intact).
-                if (!$hasAtt && $date >= $today) {
-                    $updateMeta->execute([
-                        ':tsid' => (int)$schedule['schedule_id'],
-                        ':lid' => (int)$schedule['lecturer_id'],
-                        ':room' => $schedule['room'],
-                        ':sid' => (int)$row['session_id'],
-                    ]);
-                    $updated++;
-                }
-                continue;
+        $ownTx = !$pdo->inTransaction();
+        if ($ownTx) $pdo->beginTransaction();
+        try {
+            $lock = $pdo->prepare('SELECT section_id FROM ClassSection WHERE section_id = ? FOR UPDATE');
+            $lock->execute([(int)$schedule['section_id']]);
+            $fresh = $pdo->prepare('SELECT * FROM TeachingSchedule WHERE schedule_id = ? FOR UPDATE');
+            $fresh->execute([(int)$schedule['schedule_id']]);
+            $schedule = $fresh->fetch();
+            if (!$schedule || $schedule['status'] !== 'Active') {
+                throw new RuntimeException('Không tìm thấy lịch giảng dạy đang áp dụng.');
             }
-
-            $insert->execute([
-                ':sid' => (int)$schedule['section_id'],
-                ':tsid' => (int)$schedule['schedule_id'],
-                ':lid' => (int)$schedule['lecturer_id'],
-                ':d' => $date,
-                ':st' => $start,
-                ':en' => $end,
-                ':room' => $schedule['room'],
-            ]);
-            $inserted++;
+            $sectionId = (int)$schedule['section_id'];
+            $expected = self::expectedSessions($schedule);
+            $start = $schedule['start_time'];
+            $end = $schedule['end_time'];
+            $now = date('Y-m-d H:i:s');
+            $q = $pdo->prepare(
+                "SELECT ats.*,
+                        EXISTS(SELECT 1 FROM Attendance a WHERE a.session_id = ats.session_id) AS has_attendance,
+                        EXISTS(SELECT 1 FROM ScheduleChangeRequest r WHERE r.session_id = ats.session_id) AS has_request,
+                        EXISTS(SELECT 1 FROM AttendanceSession m WHERE m.original_session_id = ats.session_id) AS has_makeup
+                 FROM AttendanceSession ats WHERE ats.section_id = ?
+                 ORDER BY ats.session_date, ats.start_time, ats.session_id FOR UPDATE"
+            );
+            $q->execute([$sectionId]);
+            $rows = $q->fetchAll();
+            $fixed = $mutable = $occupiedDates = [];
+            $maxNo = 0;
+            $regularCount = 0;
+            foreach ($rows as $row) {
+                $maxNo = max($maxNo, (int)$row['session_no']);
+                if ($row['session_type'] !== 'Regular') continue;
+                $regularCount++;
+                if ($row['session_date'] . ' ' . $row['start_time'] <= $now
+                    || $row['has_attendance'] || $row['has_request'] || $row['has_makeup']
+                    || $row['status'] !== 'Scheduled') {
+                    $fixed[] = $row;
+                    $occupiedDates[$row['session_date']] = true;
+                } else {
+                    $mutable[(int)$row['session_id']] = $row;
+                }
+            }
+            if (count($fixed) > $expected) {
+                throw new RuntimeException('Có ' . count($fixed) . ' buổi lịch sử/đã điểm danh/có đề xuất phải giữ nguyên. Số buổi dự kiến không được nhỏ hơn số này.');
+            }
+            $needed = $expected - count($fixed);
+            $dates = [];
+            foreach (self::targetDates($schedule) as $date) {
+                if (count($dates) === $needed) break;
+                if (isset($occupiedDates[$date])) continue;
+                // Once teaching has begun, a timetable edit must never invent past sessions.
+                if ($regularCount > 0 && $date . ' ' . $start <= $now) continue;
+                $dates[] = $date;
+            }
+            if (count($dates) < $needed) {
+                throw new RuntimeException('Không đủ ngày học: giữ nguyên ' . count($fixed) . ' buổi, còn ' . count($dates)
+                    . ' ngày phù hợp nhưng cần thêm ' . $needed . ' buổi. Hãy điều chỉnh khoảng ngày hoặc số buổi dự kiến.');
+            }
+            $plan = [];
+            foreach ($dates as $date) {
+                $plan[$date] = null;
+                foreach ($mutable as $id => $row) {
+                    if ($row['session_date'] === $date) {
+                        $plan[$date] = $row;
+                        unset($mutable[$id]);
+                        break;
+                    }
+                }
+            }
+            foreach ($plan as $date => $row) {
+                if ($row === null && $mutable) {
+                    $id = array_key_first($mutable);
+                    $plan[$date] = $mutable[$id];
+                    unset($mutable[$id]);
+                }
+                $clash = $pdo->prepare(
+                    "SELECT session_id FROM AttendanceSession
+                     WHERE session_date = :d AND start_time < :en AND end_time > :st
+                       AND status = 'Scheduled' AND (section_id <> :sec OR session_type = 'Makeup')
+                       AND (section_id = :own OR lecturer_id = :lid OR room = :room) LIMIT 1"
+                );
+                $clash->execute([':d' => $date, ':en' => $end, ':st' => $start,
+                    ':sec' => $sectionId, ':own' => $sectionId, ':lid' => $schedule['lecturer_id'], ':room' => $schedule['room']]);
+                if ($clash->fetchColumn()) {
+                    throw new RuntimeException('Trùng lịch giảng viên, phòng học hoặc buổi học bù vào ngày ' . $date . '.');
+                }
+            }
+            $removed = 0;
+            foreach ($mutable as $row) {
+                $pdo->prepare('DELETE FROM AttendanceSession WHERE session_id = ?')->execute([$row['session_id']]);
+                $removed++;
+            }
+            $inserted = $updated = 0;
+            foreach ($plan as $date => $row) {
+                if ($row) {
+                    $pdo->prepare(
+                        'UPDATE AttendanceSession SET schedule_id = ?, lecturer_id = ?, session_date = ?,
+                         start_time = ?, end_time = ?, room = ? WHERE session_id = ?'
+                    )->execute([$schedule['schedule_id'], $schedule['lecturer_id'], $date, $start, $end,
+                        $schedule['room'], $row['session_id']]);
+                    $updated++;
+                } else {
+                    $pdo->prepare(
+                        "INSERT INTO AttendanceSession
+                            (section_id, schedule_id, lecturer_id, session_no, session_date, start_time, end_time, room, session_type, status)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Regular', 'Scheduled')"
+                    )->execute([$sectionId, $schedule['schedule_id'], $schedule['lecturer_id'], ++$maxNo,
+                        $date, $start, $end, $schedule['room']]);
+                    $inserted++;
+                }
+            }
+            if ($ownTx) $pdo->commit();
+            return ['inserted' => $inserted, 'updated' => $updated, 'removed' => $removed,
+                'dates' => $dates, 'expected' => $expected, 'total' => $expected];
+        } catch (Throwable $e) {
+            if ($ownTx && $pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
         }
-
-        // Remove stale future generated sessions (safe cleanup only).
-        $future = $pdo->prepare(
-            'SELECT session_id, session_date, start_time, status
-             FROM AttendanceSession
-             WHERE schedule_id = :tsid AND session_date > CURDATE()'
-        );
-        $future->execute([':tsid' => (int)$schedule['schedule_id']]);
-        $removed = 0;
-        foreach ($future->fetchAll() as $row) {
-            $hm = substr($row['start_time'], 0, 5);
-            $matches = isset($dateSet[$row['session_date']]) && $hm === $startHm;
-            if ($matches) continue;
-            if ($row['status'] === 'Cancelled') continue;
-            $attCount->execute([':sid' => (int)$row['session_id']]);
-            if ((int)$attCount->fetchColumn() > 0) continue;
-            $reqCount->execute([':sid' => (int)$row['session_id']]);
-            if ((int)$reqCount->fetchColumn() > 0) continue;
-
-            $pdo->prepare('DELETE FROM AttendanceSession WHERE session_id = :sid')
-                ->execute([':sid' => (int)$row['session_id']]);
-            $removed++;
-        }
-
-        return ['inserted' => $inserted, 'updated' => $updated, 'removed' => $removed, 'dates' => $dates];
     }
 
     private static function targetDates(array $schedule): array {
@@ -398,7 +530,8 @@ class TeachingSchedule {
 
     public static function getLecturerSessions(int $lecturerId, int $semesterId, ?int $sectionId = null): array {
         $pdo = get_db();
-        $sql = 'SELECT ats.session_id, ats.section_id, ats.session_date, ats.start_time, ats.end_time,
+        $sql = 'SELECT ats.session_id, ats.section_id, ats.session_no, ats.session_date,
+                       ats.start_time, ats.end_time,
                        ats.room, ats.topic, ats.session_type, ats.status, ats.cancelled_at,
                        ats.original_session_id,
                        cs.section_code, cs.course_id,
@@ -508,8 +641,9 @@ class TeachingSchedule {
         $room = substr(trim($room), 0, 30);
 
         if (mb_strlen($reason) < 5) return ['ok' => false, 'message' => 'Vui lòng nhập lý do học bù (ít nhất 5 ký tự).'];
-        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) return ['ok' => false, 'message' => 'Ngày học bù không hợp lệ.'];
-        if (!preg_match('/^\d{2}:\d{2}(:\d{2})?$/', $start) || !preg_match('/^\d{2}:\d{2}(:\d{2})?$/', $end)) {
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) || date('Y-m-d', strtotime($date)) !== $date) return ['ok' => false, 'message' => 'Ngày học bù không hợp lệ.'];
+        if ($room === '') return ['ok' => false, 'message' => 'Vui lòng nhập phòng học bù.'];
+        if (!preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/', $start) || !preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/', $end)) {
             return ['ok' => false, 'message' => 'Giờ học bù không hợp lệ.'];
         }
         if (strtotime($end) <= strtotime($start)) return ['ok' => false, 'message' => 'Giờ kết thúc phải sau giờ bắt đầu.'];
@@ -541,7 +675,7 @@ class TeachingSchedule {
 
         $dup = $pdo->prepare(
             'SELECT COUNT(*) FROM ScheduleChangeRequest
-             WHERE session_id = :sid AND request_type = \'Makeup\' AND status = \'Pending\''
+             WHERE session_id = :sid AND request_type = \'Makeup\' AND status IN (\'Pending\',\'Approved\')'
         );
         $dup->execute([':sid' => $sessionId]);
         if ((int)$dup->fetchColumn() > 0) {
@@ -657,8 +791,12 @@ class TeachingSchedule {
         }
 
         $pdo = get_db();
+        $ownTx = !$pdo->inTransaction();
+        $reviewStarted = false;
         try {
-            $pdo->beginTransaction();
+            if ($ownTx) $pdo->beginTransaction();
+            else $pdo->exec('SAVEPOINT schedule_request_review');
+            $reviewStarted = true;
 
             $q = $pdo->prepare(
                 'SELECT r.*, ats.session_date, ats.start_time, ats.end_time, ats.status AS session_status,
@@ -672,18 +810,21 @@ class TeachingSchedule {
             );
             $q->execute([':rid' => $requestId]);
             $req = $q->fetch();
-            if (!$req) { $pdo->rollBack(); return ['ok' => false, 'message' => 'Đề xuất không tồn tại.']; }
+            if (!$req) throw new RuntimeException('Đề xuất không tồn tại.');
             if ($req['status'] !== 'Pending') {
-                $pdo->rollBack();
-                return ['ok' => false, 'message' => 'Đề xuất này đã được xử lý (' . $req['status'] . ').'];
+                throw new RuntimeException('Đề xuất này đã được xử lý (' . $req['status'] . ').');
             }
 
             $createdSessionId = null;
 
             if ($decision === 'Approved' && $req['request_type'] === 'Cancellation') {
                 if ($req['session_status'] === 'Cancelled') {
-                    $pdo->rollBack();
-                    return ['ok' => false, 'message' => 'Buổi học đã ở trạng thái đã hủy.'];
+                    throw new RuntimeException('Buổi học đã ở trạng thái đã hủy.');
+                }
+                $hasAttendance = $pdo->prepare('SELECT COUNT(*) FROM Attendance WHERE session_id = ?');
+                $hasAttendance->execute([(int)$req['session_id']]);
+                if ($hasAttendance->fetchColumn() || $req['session_date'] . ' ' . $req['start_time'] <= date('Y-m-d H:i:s')) {
+                    throw new RuntimeException('Không thể hủy buổi đã diễn ra hoặc đã có điểm danh.');
                 }
                 $pdo->prepare(
                     'UPDATE AttendanceSession SET status = \'Cancelled\', cancelled_at = NOW()
@@ -692,24 +833,38 @@ class TeachingSchedule {
             }
 
             if ($decision === 'Approved' && $req['request_type'] === 'Makeup') {
+                if ($req['session_status'] !== 'Cancelled') {
+                    throw new RuntimeException('Phải duyệt hủy buổi gốc trước khi duyệt học bù.');
+                }
+                if ($req['proposed_date'] . ' ' . $req['proposed_start_time'] <= date('Y-m-d H:i:s')
+                    || (int)$req['lecturer_id'] !== (int)$req['section_lecturer']) {
+                    throw new RuntimeException('Ngày học bù đã qua hoặc giảng viên phụ trách đã thay đổi. Vui lòng gửi đề xuất mới.');
+                }
                 $dup = $pdo->prepare(
-                    'SELECT COUNT(*) FROM AttendanceSession
-                     WHERE section_id = :sec AND session_date = :d AND start_time = :st'
+                    "SELECT COUNT(*) FROM AttendanceSession
+                     WHERE (original_session_id = :orig AND status = 'Scheduled')
+                        OR (session_date = :d AND start_time < :en AND end_time > :st AND status = 'Scheduled'
+                            AND (section_id = :sec OR lecturer_id = :lid OR room = :room))"
                 );
                 $dup->execute([
-                    ':sec' => (int)$req['section_id'], ':d' => $req['proposed_date'],
-                    ':st' => $req['proposed_start_time'],
+                    ':orig' => (int)$req['session_id'], ':sec' => (int)$req['section_id'], ':d' => $req['proposed_date'],
+                    ':st' => $req['proposed_start_time'], ':en' => $req['proposed_end_time'],
+                    ':lid' => $req['lecturer_id'], ':room' => $req['proposed_room'],
                 ]);
                 if ((int)$dup->fetchColumn() > 0) {
-                    $pdo->rollBack();
-                    return ['ok' => false, 'message' => 'Không thể duyệt: đã có buổi học trùng ngày và giờ của lớp này.'];
+                    throw new RuntimeException('Không thể duyệt: đã có buổi học trùng ngày và giờ của lớp này.');
                 }
+                $number = $pdo->prepare('SELECT COALESCE(MAX(session_no), 0) + 1 FROM AttendanceSession WHERE section_id = ?');
+                $number->execute([(int)$req['section_id']]);
+                $schedule = self::getScheduleBySection((int)$req['section_id']);
                 $pdo->prepare(
                     'INSERT INTO AttendanceSession
-                        (section_id, schedule_id, lecturer_id, session_date, start_time, end_time,
+                        (section_id, schedule_id, lecturer_id, session_no, session_date, start_time, end_time,
                          room, topic, session_type, status, original_session_id)
-                     VALUES (:sec, NULL, :lid, :d, :st, :en, :room, :topic, \'Makeup\', \'Scheduled\', :orig)'
+                     VALUES (:sec, :schedule, :lid, :number, :d, :st, :en, :room, :topic, \'Makeup\', \'Scheduled\', :orig)'
                 )->execute([
+                    ':schedule' => $schedule ? (int)$schedule['schedule_id'] : null,
+                    ':number' => (int)$number->fetchColumn(),
                     ':sec' => (int)$req['section_id'], ':lid' => (int)$req['lecturer_id'],
                     ':d' => $req['proposed_date'], ':st' => $req['proposed_start_time'],
                     ':en' => $req['proposed_end_time'], ':room' => $req['proposed_room'],
@@ -737,21 +892,31 @@ class TeachingSchedule {
                 ], JSON_UNESCAPED_UNICODE)
             );
 
-            $pdo->commit();
-
-            // Notifications outside the transaction (best-effort).
-            self::notifyRequestOutcome($req, $decision, $note, $createdSessionId);
-
-            $msg = $decision === 'Approved'
-                ? ($req['request_type'] === 'Cancellation'
-                    ? 'Đã duyệt nghỉ buổi học. Buổi học được đánh dấu đã hủy và vẫn lưu lịch sử.'
-                    : 'Đã duyệt học bù. Buổi học bù đã được thêm vào lịch chính thức.')
-                : 'Đã từ chối đề xuất. Lịch học chính thức được giữ nguyên.';
-            return ['ok' => true, 'message' => $msg, 'created_session_id' => $createdSessionId];
+            if ($ownTx) $pdo->commit();
+            else $pdo->exec('RELEASE SAVEPOINT schedule_request_review');
         } catch (Throwable $e) {
-            if ($pdo->inTransaction()) $pdo->rollBack();
-            return ['ok' => false, 'message' => 'Không thể xử lý đề xuất: ' . $e->getMessage()];
+            if ($reviewStarted && $pdo->inTransaction()) {
+                if ($ownTx) $pdo->rollBack();
+                else {
+                    $pdo->exec('ROLLBACK TO SAVEPOINT schedule_request_review');
+                    $pdo->exec('RELEASE SAVEPOINT schedule_request_review');
+                }
+            }
+            return ['ok' => false, 'message' => $e instanceof RuntimeException && !($e instanceof PDOException)
+                ? $e->getMessage() : 'Không thể xử lý đề xuất: ' . $e->getMessage()];
         }
+
+        // Best-effort after review; nested notifications stay in the caller's transaction.
+        try {
+            self::notifyRequestOutcome($req, $decision, $note, $createdSessionId);
+        } catch (Throwable) {}
+
+        $msg = $decision === 'Approved'
+            ? ($req['request_type'] === 'Cancellation'
+                ? 'Đã duyệt nghỉ buổi học. Buổi học được đánh dấu đã hủy và vẫn lưu lịch sử.'
+                : 'Đã duyệt học bù. Buổi học bù đã được thêm vào lịch chính thức.')
+            : 'Đã từ chối đề xuất. Lịch học chính thức được giữ nguyên.';
+        return ['ok' => true, 'message' => $msg, 'created_session_id' => $createdSessionId];
     }
 
     // ─────────────────────────────────────────────────────────
@@ -761,18 +926,21 @@ class TeachingSchedule {
     public static function getStudentTimetable(string $studentId, int $semesterId): array {
         $pdo = get_db();
         $stmt = $pdo->prepare(
-            'SELECT ats.session_id, ats.session_date, ats.start_time, ats.end_time,
+            'SELECT ats.session_id, ats.session_no, ats.session_date, ats.start_time, ats.end_time,
                     COALESCE(ats.room, cs.room) AS room,
                     ats.session_type, ats.status, ats.cancelled_at, ats.original_session_id,
                     cs.section_id, cs.section_code, cs.schedule, cs.section_status,
                     c.course_code, c.course_name, c.credits,
-                    l.full_name AS lecturer_name
+                    l.full_name AS lecturer_name,
+                    att.status AS attendance_status, att.note AS attendance_note
              FROM Enrollment e
              JOIN ClassSection cs ON cs.section_id = e.section_id
              JOIN Course c ON c.course_id = cs.course_id
              JOIN Semester sem ON sem.semester_id = cs.semester_id
              JOIN AttendanceSession ats ON ats.section_id = cs.section_id
              LEFT JOIN Lecturer l ON l.lecturer_id = COALESCE(ats.lecturer_id, cs.lecturer_id)
+             LEFT JOIN Attendance att ON att.session_id = ats.session_id
+                                     AND att.enrollment_id = e.enrollment_id
              WHERE e.student_id = :sid AND e.status IN (\'Enrolled\',\'Completed\')
                AND cs.semester_id = :sem
              ORDER BY ats.session_date ASC, ats.start_time ASC'
@@ -786,7 +954,7 @@ class TeachingSchedule {
         $missing = $pdo->prepare(
             "SELECT cs.section_id, cs.section_code, cs.schedule, cs.study_days,
                     cs.start_time, cs.end_time, cs.room, cs.section_status,
-                    c.course_code, c.course_name, c.credits,
+                    c.course_code, c.course_name, c.credits, c.default_sessions,
                     l.full_name AS lecturer_name,
                     sem.start_date, sem.end_date
              FROM Enrollment e
@@ -811,18 +979,24 @@ class TeachingSchedule {
             $byDay = [];
             foreach ($slots as $slot) $byDay[(int)$slot['day']][] = $slot;
 
-            for ($d = $start; $d <= $end; $d = $d->modify('+1 day')) {
+            $planned = 0;
+            $expected = (int)($sec['default_sessions'] ?? 0) > 0
+                ? min(self::MAX_SESSIONS, (int)$sec['default_sessions'])
+                : self::expectedSessionsForCredits((int)$sec['credits']);
+            for ($d = $start; $d <= $end && $planned < $expected; $d = $d->modify('+1 day')) {
                 $dow = (int)$d->format('N');
                 if (empty($byDay[$dow])) continue;
                 foreach ($byDay[$dow] as $slot) {
+                    if ($planned >= $expected) break;
                     $sessions[] = [
+                        'session_no'          => ++$planned,
                         'session_id'          => $syntheticId--,
                         'session_date'        => $d->format('Y-m-d'),
                         'start_time'          => $slot['start'],
                         'end_time'            => $slot['end'],
                         'room'                => $sec['room'],
                         'session_type'        => 'Regular',
-                        'status'              => $sec['section_status'] === 'Confirmed' ? 'Scheduled' : 'Pending',
+                        'status'              => 'Pending',
                         'cancelled_at'        => null,
                         'original_session_id' => null,
                         'section_id'          => (int)$sec['section_id'],

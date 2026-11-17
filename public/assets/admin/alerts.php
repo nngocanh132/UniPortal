@@ -74,13 +74,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'recalc_all') {
+        set_time_limit(0);
+        ignore_user_abort(true);
         $students = $pdo->query("SELECT student_id FROM Student WHERE status='Active'")->fetchAll();
         $count = 0;
         foreach ($students as $s) {
             $result = AcademicAlertService::recalcGpa($s['student_id']);
             $count += $result['warnings_created'];
         }
-        flash_set('success', "Đã tái tính GPA và tạo $count cảnh báo mới.");
+        flash_set('success', "Đã tái tính GPA và tạo $count cảnh báo mới cho " . count($students) . " sinh viên.");
         header('Location: alerts.php'); exit;
     }
 }
@@ -98,7 +100,7 @@ if ($filter === 'active')   $where .= " AND aw.status = 'Active'";
 if ($filter === 'resolved') $where .= " AND aw.status = 'Resolved'";
 if ($filter === 'unread')   $where .= " AND aw.is_read = FALSE";
 if ($typeF !== '')          { $where .= " AND aw.warning_type = :type"; $params[':type'] = $typeF; }
-if ($search !== '')         { $where .= " AND (s.full_name LIKE :q OR s.student_id LIKE :q)"; $params[':q'] = '%'.$search.'%'; }
+if ($search !== '')        { $where .= " AND (s.full_name LIKE :q1 OR s.student_id LIKE :q2)"; $params[':q1'] = '%'.$search.'%'; $params[':q2'] = '%'.$search.'%'; }
 
 $countSt = $pdo->prepare("SELECT COUNT(*) FROM AcademicWarning aw JOIN Student s ON s.student_id=aw.student_id $where");
 $countSt->execute($params);
@@ -107,12 +109,12 @@ $totalPages = max(1, (int)ceil($totalRows / $perPage));
 $offset = ($page - 1) * $perPage;
 
 $stmt = $pdo->prepare(
-    "SELECT aw.warning_id, aw.warning_type, aw.message, aw.created_at, aw.is_read, aw.status,
+    "SELECT aw.warning_id, aw.warning_type, aw.warning_level, aw.message, aw.created_at, aw.is_read, aw.status,
             s.student_id, s.full_name, s.class_code
      FROM AcademicWarning aw
      JOIN Student s ON s.student_id = aw.student_id
      $where
-     ORDER BY aw.is_read ASC, aw.created_at DESC
+     ORDER BY aw.is_read ASC, aw.warning_level DESC, aw.created_at DESC
      LIMIT $perPage OFFSET $offset"
 );
 $stmt->execute($params);
@@ -123,6 +125,12 @@ $totalActive   = (int)$pdo->query("SELECT COUNT(*) FROM AcademicWarning WHERE st
 $totalUnread   = (int)$pdo->query("SELECT COUNT(*) FROM AcademicWarning WHERE is_read=FALSE AND status='Active'")->fetchColumn();
 $totalResolved = (int)$pdo->query("SELECT COUNT(*) FROM AcademicWarning WHERE status='Resolved'")->fetchColumn();
 $totalAll      = (int)$pdo->query("SELECT COUNT(*) FROM AcademicWarning")->fetchColumn();
+
+$levelCounts = [1 => 0, 2 => 0, 3 => 0];
+foreach ($pdo->query("SELECT warning_level, COUNT(*) AS c FROM AcademicWarning WHERE status='Active' GROUP BY warning_level") as $lr) {
+    $lvl = (int)$lr['warning_level'];
+    if (isset($levelCounts[$lvl])) $levelCounts[$lvl] = (int)$lr['c'];
+}
 
 // Students list for add-warning modal
 $studentList = $pdo->query("SELECT student_id, full_name, class_code FROM Student WHERE status='Active' ORDER BY student_id LIMIT 200")->fetchAll();
@@ -183,6 +191,20 @@ require __DIR__ . '/_layout.php';
     </div>
 </div>
 
+<!-- ═══ SEVERITY DISTRIBUTION ══════════════════════════════ -->
+<div class="acard" style="padding:12px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px;">
+    <span style="font-weight:700;color:#334155;">Mức độ đang hoạt động:</span>
+    <span style="padding:4px 10px;border-radius:9999px;background:#dbeafe;color:#1d4ed8;font-weight:700;">
+        Nhắc nhở · <?= number_format($levelCounts[1]) ?>
+    </span>
+    <span style="padding:4px 10px;border-radius:9999px;background:#fef3c7;color:#b45309;font-weight:700;">
+        Cần chú ý · <?= number_format($levelCounts[2]) ?>
+    </span>
+    <span style="padding:4px 10px;border-radius:9999px;background:#fee2e2;color:#b91c1c;font-weight:700;">
+        Nguy cơ cao · <?= number_format($levelCounts[3]) ?>
+    </span>
+</div>
+
 <!-- ═══ FILTER TABS + SEARCH ═══════════════════════════════ -->
 <div class="acard" style="padding:14px 16px;">
     <form method="GET" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
@@ -235,6 +257,7 @@ require __DIR__ . '/_layout.php';
                 <tr style="background:#f8fafc;border-bottom:2px solid #e2e8f0;">
                     <th style="padding:10px 14px;text-align:left;font-weight:600;color:#334155;white-space:nowrap;">Sinh viên</th>
                     <th style="padding:10px 14px;text-align:left;font-weight:600;color:#334155;">Loại</th>
+                    <th style="padding:10px 14px;text-align:left;font-weight:600;color:#334155;white-space:nowrap;">Mức độ</th>
                     <th style="padding:10px 14px;text-align:left;font-weight:600;color:#334155;">Nội dung cảnh báo</th>
                     <th style="padding:10px 14px;text-align:left;font-weight:600;color:#334155;white-space:nowrap;">Ngày tạo</th>
                     <th style="padding:10px 14px;text-align:center;font-weight:600;color:#334155;">Trạng thái</th>
@@ -243,7 +266,7 @@ require __DIR__ . '/_layout.php';
             </thead>
             <tbody>
                 <?php if (empty($warnings)): ?>
-                <tr><td colspan="6" style="text-align:center;padding:40px;color:#94a3b8;font-style:italic;">
+                <tr><td colspan="7" style="text-align:center;padding:40px;color:#94a3b8;font-style:italic;">
                     Không có cảnh báo nào phù hợp với bộ lọc.
                 </td></tr>
                 <?php else: ?>
@@ -254,6 +277,12 @@ require __DIR__ . '/_layout.php';
                         default                   => 'background:#fef9c3;color:#854d0e;',
                     };
                     $isUnread = !$w['is_read'] && $w['status'] === 'Active';
+                    $wl = (int)$w['warning_level'] ?: 1;
+                    [$lvlLabel, $lvlStyle] = match($wl) {
+                        3 => ['Nguy cơ cao',  'background:#fee2e2;color:#b91c1c;'],
+                        2 => ['Cần chú ý',    'background:#fef3c7;color:#b45309;'],
+                        default => ['Nhắc nhở', 'background:#dbeafe;color:#1d4ed8;'],
+                    };
                 ?>
                 <tr style="border-bottom:1px solid #f1f5f9;<?= $isUnread ? 'background:#fffbeb;' : '' ?>">
                     <td style="padding:10px 14px;">
@@ -268,6 +297,11 @@ require __DIR__ . '/_layout.php';
                     <td style="padding:10px 14px;">
                         <span style="padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;<?= $typeCls ?>">
                             <?= htmlspecialchars($typeLabels[$w['warning_type']] ?? $w['warning_type']) ?>
+                        </span>
+                    </td>
+                    <td style="padding:10px 14px;">
+                        <span style="padding:3px 8px;border-radius:9999px;font-size:11px;font-weight:700;white-space:nowrap;<?= $lvlStyle ?>">
+                            <?= $lvlLabel ?>
                         </span>
                     </td>
                     <td style="padding:10px 14px;max-width:360px;">

@@ -70,7 +70,7 @@ class LecturerModel {
                      WHERE a3.section_id = e.section_id AND a3.is_deleted = 0
                        AND a3.status <> \'Draft\') AS assignment_total,
                     (SELECT COUNT(*) FROM Submission sub
-                     WHERE sub.enrollment_id = e.enrollment_id) AS submitted_total
+                     WHERE sub.enrollment_id = e.enrollment_id AND sub.submitted_at IS NOT NULL) AS submitted_total
              FROM Enrollment e
              JOIN Student s ON s.student_id = e.student_id
              WHERE e.section_id = :sid
@@ -131,7 +131,7 @@ class LecturerModel {
     public static function getAttendanceSessions(int $section_id): array {
         $pdo  = get_db();
         $stmt = $pdo->prepare(
-            'SELECT ats.session_id, ats.session_date, ats.start_time, ats.end_time, ats.topic,
+            'SELECT ats.session_id, ats.session_no, ats.session_date, ats.start_time, ats.end_time, ats.topic,
                     ats.room, ats.session_type, ats.status, ats.original_session_id, ats.cancelled_at,
                     COALESCE(ats.lecturer_id, cs.lecturer_id) AS lecturer_id,
                     (SELECT COUNT(*) FROM Attendance a WHERE a.session_id = ats.session_id
@@ -158,7 +158,7 @@ class LecturerModel {
     public static function getOwnedSession(int $session_id, int $lecturer_id): array|false {
         $pdo  = get_db();
         $stmt = $pdo->prepare(
-            'SELECT ats.session_id, ats.section_id, ats.session_date,
+            'SELECT ats.session_id, ats.session_no, ats.section_id, ats.session_date,
                     ats.start_time, ats.end_time, ats.topic, ats.room,
                     ats.session_type, ats.status, cs.section_code
              FROM AttendanceSession ats
@@ -194,23 +194,33 @@ class LecturerModel {
         return $stmt->fetchAll();
     }
 
-    // ── Warnings for students in lecturer's sections ──────────
+    // ── Warnings scoped to the lecturer's own classes ─────────
+    // A warning is visible when its own section belongs to the lecturer;
+    // course-level warnings (no section) are visible when the student is
+    // enrolled in at least one of the lecturer's sections.
     public static function getWarningsForLecturer(int $lecturer_id, int $limit = 20): array {
         $pdo  = get_db();
         $stmt = $pdo->prepare(
-            'SELECT DISTINCT aw.warning_id, aw.warning_type, aw.message,
+            'SELECT DISTINCT aw.warning_id, aw.warning_type, aw.warning_level, aw.message,
                     aw.created_at, aw.is_read, aw.status AS warn_status,
                     s.student_id, s.full_name, s.class_code,
                     cs.section_code
              FROM AcademicWarning aw
              JOIN Student s ON s.student_id = aw.student_id
-             JOIN Enrollment e ON e.student_id = s.student_id
-             JOIN ClassSection cs ON cs.section_id = e.section_id
-             WHERE cs.lecturer_id = :lid
-             ORDER BY aw.is_read ASC, aw.created_at DESC
+             LEFT JOIN ClassSection cs ON cs.section_id = aw.section_id
+             WHERE (
+                    (aw.section_id IS NOT NULL AND cs.lecturer_id = :lid1)
+                 OR (aw.section_id IS NULL AND EXISTS (
+                        SELECT 1 FROM Enrollment e
+                        JOIN ClassSection cse ON cse.section_id = e.section_id
+                        WHERE e.student_id = aw.student_id AND cse.lecturer_id = :lid2
+                    ))
+             )
+             ORDER BY aw.is_read ASC, aw.warning_level DESC, aw.created_at DESC
              LIMIT :lim'
         );
-        $stmt->bindValue(':lid', $lecturer_id, PDO::PARAM_INT);
+        $stmt->bindValue(':lid1', $lecturer_id, PDO::PARAM_INT);
+        $stmt->bindValue(':lid2', $lecturer_id, PDO::PARAM_INT);
         $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
         $stmt->execute();
         return $stmt->fetchAll();
@@ -222,13 +232,19 @@ class LecturerModel {
         $stmt = $pdo->prepare(
             'SELECT COUNT(DISTINCT aw.warning_id)
              FROM AcademicWarning aw
-             JOIN Enrollment e ON e.student_id = aw.student_id
-             JOIN ClassSection cs ON cs.section_id = e.section_id
-             WHERE cs.lecturer_id = :lid
+             LEFT JOIN ClassSection cs ON cs.section_id = aw.section_id
+             WHERE (
+                    (aw.section_id IS NOT NULL AND cs.lecturer_id = :lid1)
+                 OR (aw.section_id IS NULL AND EXISTS (
+                        SELECT 1 FROM Enrollment e
+                        JOIN ClassSection cse ON cse.section_id = e.section_id
+                        WHERE e.student_id = aw.student_id AND cse.lecturer_id = :lid2
+                    ))
+             )
                AND aw.is_read = FALSE
                AND aw.status = \'Active\''
         );
-        $stmt->execute([':lid' => $lecturer_id]);
+        $stmt->execute([':lid1' => $lecturer_id, ':lid2' => $lecturer_id]);
         return (int)$stmt->fetchColumn();
     }
 
@@ -309,15 +325,16 @@ class LecturerModel {
         string $feedback = ''
     ): bool {
         $pdo  = get_db();
-        // Check enrollment is in a section owned by this lecturer
         $check = $pdo->prepare(
-            'SELECT cs.lecturer_id FROM Enrollment e
+            'SELECT cs.lecturer_id, a.max_score FROM Enrollment e
              JOIN ClassSection cs ON cs.section_id = e.section_id
+             JOIN Assessment a ON a.section_id = e.section_id AND a.assessment_id = :aid
              WHERE e.enrollment_id = :eid LIMIT 1'
         );
-        $check->execute([':eid' => $enrollment_id]);
+        $check->execute([':eid' => $enrollment_id, ':aid' => $assessment_id]);
         $row = $check->fetch();
-        if (!$row || (int)$row['lecturer_id'] !== $graded_by) return false;
+        if (!$row || (int)$row['lecturer_id'] !== $graded_by || !is_finite($score)
+            || $score < 0 || $score > (float)$row['max_score']) return false;
 
         $stmt = $pdo->prepare(
             'INSERT INTO Grade (enrollment_id, assessment_id, score, feedback, graded_by, graded_at)
@@ -344,56 +361,47 @@ class LecturerModel {
         int $account_id,
         int $lecturer_id = 0
     ): int {
-        $pdo  = get_db();
-
-        // Resolve the session's section/status; when a lecturer id is supplied,
-        // the session must belong to a section that lecturer is assigned to and
-        // must not be cancelled.
-        $sessQ = $pdo->prepare(
-            'SELECT ats.section_id, ats.status, cs.lecturer_id
-             FROM AttendanceSession ats
-             JOIN ClassSection cs ON cs.section_id = ats.section_id
-             WHERE ats.session_id = :sess LIMIT 1'
-        );
-        $sessQ->execute([':sess' => $session_id]);
-        $sess = $sessQ->fetch();
-        if (!$sess) return 0;
-        if ($sess['status'] !== 'Scheduled') return 0;
-        if ($lecturer_id > 0 && (int)$sess['lecturer_id'] !== $lecturer_id) return 0;
-        $sectionId = (int)$sess['section_id'];
-
-        // Only enrollments belonging to this session's section are accepted.
-        $memberQ = $pdo->prepare(
-            'SELECT 1 FROM Enrollment WHERE enrollment_id = :eid AND section_id = :sid LIMIT 1'
-        );
-
-        $saved = 0;
-        foreach ($records as $enrollment_id => $data) {
-            $enrollment_id = (int)$enrollment_id;
-            $memberQ->execute([':eid' => $enrollment_id, ':sid' => $sectionId]);
-            if (!$memberQ->fetch()) continue;
-
-            $status = in_array($data['status'] ?? '', ['Present','Absent','Late','Excused'])
-                ? $data['status'] : 'Present';
-            $note   = substr($data['note'] ?? '', 0, 255);
+        $pdo = get_db();
+        $ownTx = !$pdo->inTransaction();
+        if ($ownTx) $pdo->beginTransaction();
+        try {
+            $sessQ = $pdo->prepare(
+                'SELECT ats.section_id, ats.status, cs.lecturer_id
+                 FROM AttendanceSession ats
+                 JOIN ClassSection cs ON cs.section_id = ats.section_id
+                 WHERE ats.session_id = :sess FOR UPDATE'
+            );
+            $sessQ->execute([':sess' => $session_id]);
+            $sess = $sessQ->fetch();
+            if (!$sess || $sess['status'] !== 'Scheduled'
+                || ($lecturer_id > 0 && (int)$sess['lecturer_id'] !== $lecturer_id)) {
+                if ($ownTx) $pdo->rollBack();
+                return 0;
+            }
+            $memberQ = $pdo->prepare(
+                "SELECT 1 FROM Enrollment WHERE enrollment_id = ? AND section_id = ? AND status IN ('Enrolled','Completed')"
+            );
             $stmt = $pdo->prepare(
                 'INSERT INTO Attendance (session_id, enrollment_id, status, note, recorded_by, recorded_at)
-                 VALUES (:sess, :eid, :st, :note, :by, NOW())
-                 ON DUPLICATE KEY UPDATE status = :st2, note = :note2, recorded_by = :by2, recorded_at = NOW()'
+                 VALUES (?, ?, ?, ?, ?, NOW())
+                 ON DUPLICATE KEY UPDATE status = VALUES(status), note = VALUES(note),
+                     recorded_by = VALUES(recorded_by), recorded_at = NOW()'
             );
-            $stmt->execute([
-                ':sess'  => $session_id,
-                ':eid'   => $enrollment_id,
-                ':st'    => $status,
-                ':note'  => $note,
-                ':by'    => $account_id,
-                ':st2'   => $status,
-                ':note2' => $note,
-                ':by2'   => $account_id,
-            ]);
-            $saved += $stmt->rowCount();
+            $saved = 0;
+            foreach ($records as $enrollmentId => $data) {
+                if (!is_array($data) || !in_array($data['status'] ?? '', ['Present','Absent','Late','Excused'], true)) continue;
+                $memberQ->execute([(int)$enrollmentId, (int)$sess['section_id']]);
+                if (!$memberQ->fetchColumn()) continue;
+                $stmt->execute([$session_id, (int)$enrollmentId, $data['status'],
+                    mb_substr((string)($data['note'] ?? ''), 0, 255), $account_id]);
+                $saved++;
+            }
+            if ($ownTx) $pdo->commit();
+            return $saved;
+        } catch (Throwable $e) {
+            if ($ownTx && $pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
         }
-        return $saved;
     }
 
     // ── Current active semester ───────────────────────────────

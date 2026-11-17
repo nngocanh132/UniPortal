@@ -26,6 +26,15 @@ function back_to_section(int $semId, int $sectionId): never {
     header('Location: courses.php?tab=sections&sem=' . $semId . '&section=' . $sectionId);
     exit;
 }
+function section_has_official_schedule(PDO $pdo, int $sectionId): bool {
+    // Inactive schedules also own session history and must use the schedule workflow.
+    $s = $pdo->prepare('SELECT 1 FROM TeachingSchedule WHERE section_id=:sid LIMIT 1');
+    $s->execute([':sid'=>$sectionId]);
+    return (bool)$s->fetchColumn();
+}
+function section_schedule_url(int $semId, int $courseId, int $sectionId): string {
+    return 'schedule.php?sem=' . $semId . '&course=' . $courseId . '&section=' . $sectionId;
+}
 
 // ── POST handlers ──────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -132,6 +141,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Location: courses.php?tab=sections'); exit;
         }
 
+        $hasOfficialSchedule = false;
+        if ($isEdit) {
+            $old = $pdo->prepare('SELECT * FROM ClassSection WHERE section_id=:id LIMIT 1');
+            $old->execute([':id'=>$secId]);
+            $oldRow = $old->fetch();
+            if (!$oldRow) {
+                $_SESSION['_flash'] = ['type'=>'error','message'=>'Lớp học phần không tồn tại.'];
+                header('Location: courses.php?tab=sections'); exit;
+            }
+
+            $identityChanged = $payload['course_id'] !== (int)$oldRow['course_id']
+                || $payload['semester_id'] !== (int)$oldRow['semester_id'];
+            $hasOfficialSchedule = section_has_official_schedule($pdo, $secId);
+            if ($hasOfficialSchedule) {
+                $scheduleChanged = $payload['lecturer_id'] !== (int)$oldRow['lecturer_id']
+                    || trim((string)$payload['room']) !== trim((string)$oldRow['room'])
+                    || RegistrationService::normalizeDays($payload['study_days']) !== RegistrationService::normalizeDays($oldRow['study_days'])
+                    || RegistrationService::normalizeTime($payload['start_time']) !== RegistrationService::normalizeTime($oldRow['start_time'])
+                    || RegistrationService::normalizeTime($payload['end_time']) !== RegistrationService::normalizeTime($oldRow['end_time']);
+                if ($identityChanged || $scheduleChanged) {
+                    $_SESSION['admin_schedule_flash'] = 'error:Chưa lưu thay đổi. Lớp đã có lịch giảng dạy chính thức nên không thể đổi môn học/học kỳ. '
+                        . 'Vui lòng đổi giảng viên, phòng, ngày hoặc giờ học tại trang Lịch giảng dạy để đồng bộ các buổi học tương lai và giữ nguyên lịch sử. '
+                        . 'Mã lớp, sĩ số và thời gian đăng ký vẫn được sửa tại trang Môn học & Lớp học phần.';
+                    header('Location: ' . section_schedule_url((int)$oldRow['semester_id'], (int)$oldRow['course_id'], $secId)); exit;
+                }
+            } elseif ($identityChanged) {
+                // Include withdrawn enrollments, legacy sessions and assessment/assignment history.
+                $history = $pdo->prepare(
+                    'SELECT EXISTS(SELECT 1 FROM Enrollment WHERE section_id=:enrollment)
+                         OR EXISTS(SELECT 1 FROM AttendanceSession WHERE section_id=:session)
+                         OR EXISTS(SELECT 1 FROM Assessment WHERE section_id=:assessment)
+                         OR EXISTS(SELECT 1 FROM Assignment WHERE section_id=:assignment)'
+                );
+                $history->execute([':enrollment'=>$secId, ':session'=>$secId, ':assessment'=>$secId, ':assignment'=>$secId]);
+                if ($history->fetchColumn()) {
+                    $_SESSION['_flash'] = ['type'=>'error','message'=>'Không thể đổi môn học/học kỳ của lớp đã có đăng ký hoặc lịch sử học tập. Vui lòng tạo lớp mới; mã lớp, sĩ số và thời gian đăng ký vẫn có thể chỉnh sửa.'];
+                    back_to_section((int)$oldRow['semester_id'], $secId);
+                }
+            }
+        }
+
         $validation = RegistrationService::validateSection($pdo, $payload, $isEdit ? $secId : null);
         if (!$validation['ok']) {
             $_SESSION['_flash'] = ['type'=>'error','message'=>implode(' ', $validation['errors'])];
@@ -142,23 +192,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $capacity     = $d['max_enrollment'];
 
         if ($isEdit) {
-            $old = $pdo->prepare('SELECT * FROM ClassSection WHERE section_id=:id LIMIT 1');
-            $old->execute([':id'=>$secId]);
-            $oldRow = $old->fetch();
-            $pdo->prepare(
-                'UPDATE ClassSection
-                 SET course_id=:cid, semester_id=:sem, lecturer_id=:lid, section_code=:code,
-                     schedule=:sched, room=:room, capacity=:cap, min_enrollment=:min, max_enrollment=:max,
-                     study_days=:days, start_time=:st, end_time=:en, reg_open=:ro, reg_close=:rc
-                 WHERE section_id=:id'
-            )->execute([
-                ':cid'=>$d['course_id'], ':sem'=>$d['semester_id'], ':lid'=>$d['lecturer_id'],
-                ':code'=>$d['section_code'], ':sched'=>$scheduleText, ':room'=>$d['room'],
-                ':cap'=>$capacity, ':min'=>$d['min_enrollment'], ':max'=>$d['max_enrollment'],
-                ':days'=>RegistrationService::daysToString($d['study_days']),
-                ':st'=>$d['start_time'], ':en'=>$d['end_time'],
-                ':ro'=>$d['reg_open'], ':rc'=>$d['reg_close'], ':id'=>$secId,
-            ]);
+            if ($hasOfficialSchedule) {
+                // Do not rewrite schedule-owned columns, even for equivalent form values.
+                $pdo->prepare(
+                    'UPDATE ClassSection
+                     SET section_code=:code, capacity=:cap, min_enrollment=:min, max_enrollment=:max,
+                         reg_open=:ro, reg_close=:rc WHERE section_id=:id'
+                )->execute([
+                    ':code'=>$d['section_code'], ':cap'=>$capacity,
+                    ':min'=>$d['min_enrollment'], ':max'=>$d['max_enrollment'],
+                    ':ro'=>$d['reg_open'], ':rc'=>$d['reg_close'], ':id'=>$secId,
+                ]);
+            } else {
+                $pdo->prepare(
+                    'UPDATE ClassSection
+                     SET course_id=:cid, semester_id=:sem, lecturer_id=:lid, section_code=:code,
+                         schedule=:sched, room=:room, capacity=:cap, min_enrollment=:min, max_enrollment=:max,
+                         study_days=:days, start_time=:st, end_time=:en, reg_open=:ro, reg_close=:rc
+                     WHERE section_id=:id'
+                )->execute([
+                    ':cid'=>$d['course_id'], ':sem'=>$d['semester_id'], ':lid'=>$d['lecturer_id'],
+                    ':code'=>$d['section_code'], ':sched'=>$scheduleText, ':room'=>$d['room'],
+                    ':cap'=>$capacity, ':min'=>$d['min_enrollment'], ':max'=>$d['max_enrollment'],
+                    ':days'=>RegistrationService::daysToString($d['study_days']),
+                    ':st'=>$d['start_time'], ':en'=>$d['end_time'],
+                    ':ro'=>$d['reg_open'], ':rc'=>$d['reg_close'], ':id'=>$secId,
+                ]);
+            }
             AcademicAlertService::writeAuditLog($pdo, $adminAccId, 'UPDATE_SECTION', 'ClassSection', (string)$secId,
                 json_encode($oldRow, JSON_UNESCAPED_UNICODE),
                 json_encode(['course_id'=>$d['course_id'],'semester_id'=>$d['semester_id'],'lecturer_id'=>$d['lecturer_id'],
@@ -188,9 +248,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'max'=>$d['max_enrollment'], 'days'=>RegistrationService::daysToString($d['study_days']),
                 'start'=>$d['start_time'], 'end'=>$d['end_time'],
             ], JSON_UNESCAPED_UNICODE));
-        $_SESSION['_flash'] = ['type'=>'success','message'=>"Đã tạo lớp học phần {$d['section_code']} (ngưỡng mở lớp "
-            . RegistrationService::openingThreshold($d['min_enrollment']) . ' sinh viên).'];
-        header('Location: courses.php?tab=sections&sem=' . $d['semester_id']); exit;
+        $_SESSION['admin_schedule_flash'] = "success:Đã tạo lớp học phần {$d['section_code']} (ngưỡng mở lớp "
+            . RegistrationService::openingThreshold($d['min_enrollment']) . ' sinh viên). '
+            . 'Vui lòng xác nhận và lưu lịch tuần chính thức để tạo các buổi học theo số tín chỉ. '
+            . 'Lịch dự kiến của lớp có thể chọn nhiều ngày; lịch chính thức hiện hỗ trợ một ngày trong tuần, vui lòng chọn ngày áp dụng.';
+        header('Location: ' . section_schedule_url($d['semester_id'], $d['course_id'], $newSecId)); exit;
     }
 
     if ($action === 'override_section_status') {
@@ -218,6 +280,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         );
         $secChk->execute([':sid'=>$secid]);
         $secRow = $secChk->fetch();
+
+        if ($secRow && section_has_official_schedule($pdo, $secid)) {
+            $_SESSION['admin_schedule_flash'] = 'error:Chưa thay đổi giảng viên. Lớp đã có lịch giảng dạy chính thức. '
+                . 'Vui lòng phân công giảng viên tại trang Lịch giảng dạy và lưu lịch để các buổi học tương lai được đồng bộ; lịch sử buổi học và điểm danh được giữ nguyên.';
+            header('Location: ' . section_schedule_url((int)$secRow['semester_id'], (int)$secRow['course_id'], $secid)); exit;
+        }
 
         $lecChk = $pdo->prepare(
             "SELECT l.full_name FROM Lecturer l
@@ -285,7 +353,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stuId   = trim($_POST['student_id'] ?? '');
             $override = isset($_POST['override']);
 
-            $sec = $pdo->prepare('SELECT section_id, section_code, capacity, semester_id FROM ClassSection WHERE section_id=:sid LIMIT 1');
+            $sec = $pdo->prepare(
+                'SELECT cs.section_id, cs.section_code, cs.capacity, cs.semester_id, c.credits
+                 FROM ClassSection cs JOIN Course c ON c.course_id=cs.course_id
+                 WHERE cs.section_id=:sid LIMIT 1'
+            );
             $sec->execute([':sid'=>$secId]);
             $secRow = $sec->fetch();
             $stu = $pdo->prepare("SELECT student_id, full_name FROM Student WHERE student_id=:sid AND status='Active' LIMIT 1");
@@ -300,11 +372,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $enr = $existing->fetch();
                 $count = section_enrolled($pdo, $secId);
                 $limitErr = enrollment_limit_error($count, $secRow['capacity'] !== null ? (int)$secRow['capacity'] : null, $override);
+                $credit = RegistrationService::registrationSummary($pdo, $stuId, (int)$secRow['semester_id'], $secId);
+                $creditErr = ($credit['registered'] + (int)$secRow['credits'] > $credit['max'])
+                    ? 'Vượt giới hạn tín chỉ: sinh viên đã đăng ký ' . $credit['registered'] . ' TC, môn này '
+                      . (int)$secRow['credits'] . ' TC, tối đa ' . $credit['max']
+                      . ' TC/học kỳ. Tạo ngoại lệ tín chỉ nếu được phê duyệt.'
+                    : null;
 
                 if ($enr && $enr['status'] !== 'Withdrawn') {
                     $_SESSION['_flash'] = ['type'=>'error','message'=>'Sinh viên đã có trong lớp này.'];
                 } elseif ($limitErr) {
                     $_SESSION['_flash'] = ['type'=>'error','message'=>$limitErr];
+                } elseif ($creditErr) {
+                    $_SESSION['_flash'] = ['type'=>'error','message'=>$creditErr];
                 } elseif ($enr) {
                     $pdo->prepare("UPDATE Enrollment SET status='Enrolled', enrollment_date=NOW() WHERE enrollment_id=:eid")
                         ->execute([':eid'=>$enr['enrollment_id']]);
@@ -490,7 +570,7 @@ $sections = $pdo->prepare(
     "SELECT cs.section_id, cs.section_code, cs.schedule, cs.room, cs.capacity,
             cs.min_enrollment, cs.max_enrollment, cs.study_days, cs.start_time, cs.end_time,
             cs.reg_open, cs.reg_close, cs.section_status, cs.status_note, cs.status_changed_at,
-            c.course_code, c.course_name, c.credits, c.department_id,
+            cs.course_id, c.course_code, c.course_name, c.credits, c.department_id,
             sem.semester_id, sem.semester_name, sem.academic_year,
             l.full_name AS lecturer_name, l.lecturer_id,
             (SELECT COUNT(*) FROM Enrollment e WHERE e.section_id=cs.section_id AND e.status IN ('Enrolled','Completed')) AS enrolled
@@ -847,7 +927,7 @@ require __DIR__ . '/_layout.php';
                 </select>
             </div>
             <button type="submit" class="abtn abtn--primary" style="background:#0d1b2e;height:38px;">✅ Xác nhận phân công</button>
-            <p style="font-size:11px;color:#94a3b8;margin:0;">Mỗi lớp học phần có một giảng viên phụ trách; phân công lại sẽ thay thế giảng viên hiện tại.</p>
+            <p style="font-size:11px;color:#94a3b8;margin:0;">Mỗi lớp học phần có một giảng viên phụ trách. Lớp đã có lịch chính thức phải đổi giảng viên tại trang Lịch giảng dạy để đồng bộ buổi học tương lai và giữ nguyên lịch sử.</p>
         </form>
     </div>
 
@@ -1031,7 +1111,7 @@ window.ASSIGN_SECTIONS = <?= json_encode($assignAll, JSON_UNESCAPED_UNICODE|JSON
 <div style="background:#fff;border-radius:16px;width:100%;max-width:660px;padding:28px;position:relative;max-height:92vh;overflow-y:auto;">
     <button onclick="closeModal('modalAddSection')" style="position:absolute;top:16px;right:16px;background:none;border:none;font-size:20px;cursor:pointer;">✕</button>
     <h2 style="font-size:18px;font-weight:800;color:#0d1b2e;margin-bottom:4px;">➕ Tạo lớp học phần</h2>
-    <p style="font-size:12px;color:#64748b;margin-bottom:16px;">Lịch học, phòng học và giảng viên được kiểm tra trùng tự động trước khi lưu. Lớp mới ở trạng thái <b>Chờ mở lớp</b>.</p>
+    <p style="font-size:12px;color:#64748b;margin-bottom:16px;">Lịch dự kiến, phòng học và giảng viên được kiểm tra trùng trước khi lưu. Lớp mới ở trạng thái <b>Chờ mở lớp</b>. Sau khi tạo lớp, hãy xác nhận lịch tuần chính thức để tạo buổi học theo số tín chỉ. Lịch dự kiến có thể chọn nhiều ngày; lịch chính thức hiện hỗ trợ một ngày trong tuần.</p>
     <form method="POST">
         <?= csrf_input() ?>
         <input type="hidden" name="_action" value="add_section" />
@@ -1103,7 +1183,7 @@ window.ASSIGN_SECTIONS = <?= json_encode($assignAll, JSON_UNESCAPED_UNICODE|JSON
 <div style="background:#fff;border-radius:16px;width:100%;max-width:660px;padding:28px;position:relative;max-height:92vh;overflow-y:auto;">
     <button onclick="closeModal('modalEditSection')" style="position:absolute;top:16px;right:16px;background:none;border:none;font-size:20px;cursor:pointer;">✕</button>
     <h2 style="font-size:18px;font-weight:800;color:#0d1b2e;margin-bottom:4px;">✏ Chỉnh sửa lớp <span id="es_code_label"></span></h2>
-    <p style="font-size:12px;color:#64748b;margin-bottom:16px;">Thay đổi được kiểm tra trùng lịch giảng viên, phòng học và mã lớp trước khi lưu.</p>
+    <p style="font-size:12px;color:#64748b;margin-bottom:16px;">Thay đổi được kiểm tra trùng trước khi lưu. Khi lớp đã có lịch chính thức, chỉ sửa mã lớp, sĩ số và thời gian đăng ký tại đây; đổi giảng viên, phòng và lịch tuần tại <a id="es_schedule_link" href="schedule.php">Lịch giảng dạy</a> để giữ nguyên lịch sử. Không thể đổi môn học/học kỳ khi đã có lịch chính thức hoặc dữ liệu học tập.</p>
     <form method="POST">
         <?= csrf_input() ?>
         <input type="hidden" name="_action" value="edit_section" />
@@ -1390,6 +1470,8 @@ function toLocalInput(v){
 }
 function openEditSectionModal(s){
     setVal('es_id', s.section_id);
+    document.getElementById('es_schedule_link').href = 'schedule.php?sem='+encodeURIComponent(s.semester_id)
+        +'&course='+encodeURIComponent(s.course_id)+'&section='+encodeURIComponent(s.section_id);
     document.getElementById('es_code_label').textContent = s.section_code || '';
     setVal('es_code', s.section_code);
     setVal('es_course', s.course_id);

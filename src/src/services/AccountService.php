@@ -197,11 +197,14 @@ class AccountService {
             $errors['admission_year'] = 'Năm nhập học không hợp lệ.';
         }
 
-        // date_of_birth (optional)
+        // date_of_birth (optional, must be valid and not in the future)
         if (!empty($data['date_of_birth'])) {
-            $d = DateTime::createFromFormat('Y-m-d', $data['date_of_birth']);
-            if (!$d) {
+            $dob = (string)$data['date_of_birth'];
+            $d = DateTime::createFromFormat('Y-m-d', $dob);
+            if (!$d || $d->format('Y-m-d') !== $dob) {
                 $errors['date_of_birth'] = 'Ngày sinh không hợp lệ (định dạng YYYY-MM-DD).';
+            } elseif ($dob > date('Y-m-d')) {
+                $errors['date_of_birth'] = 'Date of birth cannot be in the future.';
             }
         }
 

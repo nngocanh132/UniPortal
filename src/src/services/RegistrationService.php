@@ -13,6 +13,7 @@
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/NotificationService.php';
 require_once __DIR__ . '/AcademicAlertService.php';
+require_once __DIR__ . '/SystemConfig.php';
 
 class RegistrationService {
 
@@ -372,69 +373,13 @@ class RegistrationService {
         return $stmt->fetchAll();
     }
 
-    /**
-     * Create the regular AttendanceSession rows for a section that just became
-     * Confirmed but has no official TeachingSchedule yet. Without this the
-     * lecturer would have no sessions to take attendance or attach
-     * assignments/grades to.
-     */
     public static function ensureSessionsForSection(PDO $pdo, int $sectionId): int {
-        $q = $pdo->prepare(
-            'SELECT cs.section_id, cs.semester_id, cs.lecturer_id, cs.room, cs.section_status,
-                    cs.schedule, cs.study_days, cs.start_time, cs.end_time,
-                    sem.start_date, sem.end_date
-             FROM ClassSection cs
-             JOIN Semester sem ON sem.semester_id = cs.semester_id
-             WHERE cs.section_id = :sid LIMIT 1'
-        );
-        $q->execute([':sid' => $sectionId]);
-        $section = $q->fetch();
-        if (!$section || $section['section_status'] !== 'Confirmed') return 0;
-
-        // TeachingSchedule::syncSessions owns session generation once an
-        // official schedule exists; never duplicate it here.
-        $has = $pdo->prepare('SELECT 1 FROM TeachingSchedule WHERE section_id = :sid LIMIT 1');
-        $has->execute([':sid' => $sectionId]);
-        if ($has->fetch()) return 0;
-        $has = $pdo->prepare('SELECT 1 FROM AttendanceSession WHERE section_id = :sid LIMIT 1');
-        $has->execute([':sid' => $sectionId]);
-        if ($has->fetch()) return 0;
-
-        $slots = self::sectionSlots($section);
-        if (empty($slots)) return 0;
-
-        $start = new DateTimeImmutable($section['start_date']);
-        $today = new DateTimeImmutable(date('Y-m-d'));
-        if ($today > $start) $start = $today;
-        $end = new DateTimeImmutable($section['end_date']);
-        if ($start > $end) return 0;
-
-        $insert = $pdo->prepare(
-            "INSERT INTO AttendanceSession
-                (section_id, schedule_id, lecturer_id, session_date, start_time, end_time,
-                 room, topic, session_type, status)
-             VALUES (:sid, NULL, :lid, :d, :st, :en, :room, NULL, 'Regular', 'Scheduled')
-             ON DUPLICATE KEY UPDATE session_id = session_id"
-        );
-
-        $inserted = 0;
-        foreach ($slots as $slot) {
-            $offset = ((int)$slot['day'] - (int)$start->format('N') + 7) % 7;
-            $d = $start->modify('+' . $offset . ' days');
-            while ($d <= $end) {
-                $insert->execute([
-                    ':sid'  => $sectionId,
-                    ':lid'  => (int)$section['lecturer_id'],
-                    ':d'    => $d->format('Y-m-d'),
-                    ':st'   => $slot['start'],
-                    ':en'   => $slot['end'],
-                    ':room' => $section['room'] !== '' ? $section['room'] : null,
-                ]);
-                $inserted += $insert->rowCount() > 0 ? 1 : 0;
-                $d = $d->modify('+7 days');
-            }
-        }
-        return $inserted;
+        $q = $pdo->prepare("SELECT * FROM TeachingSchedule WHERE section_id = ? AND status = 'Active'");
+        $q->execute([$sectionId]);
+        $schedule = $q->fetch();
+        if (!$schedule) return 0;
+        require_once __DIR__ . '/../models/TeachingSchedule.php';
+        return TeachingSchedule::syncSessions($schedule)['inserted'];
     }
 
     public static function periodIsOpen(array $period): bool {
@@ -455,6 +400,478 @@ class RegistrationService {
         );
         $stmt->execute([':sid' => $studentId]);
         return $stmt->fetch();
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Course-based registration catalogue
+    // ─────────────────────────────────────────────────────────
+
+    /** Lowest final score (0–10) that still earns credit, taken from GradeScale. */
+    public static function passingScoreThreshold(PDO $pdo): float {
+        $value = $pdo->query('SELECT MIN(min_score) FROM GradeScale WHERE grade_point > 0')->fetchColumn();
+        return ($value === false || $value === null) ? 4.0 : (float)$value;
+    }
+
+    /**
+     * Official academic results per course, built from completed enrollments
+     * and weighted assessment grades.
+     *
+     * @return array<int,array{attempts:int,completed:int,best_final:?float,passed:bool,retake:bool}>
+     */
+    public static function courseAcademicResults(PDO $pdo, string $studentId): array {
+        $passThreshold = self::passingScoreThreshold($pdo);
+        $stmt = $pdo->prepare(
+            "SELECT x.course_id, COUNT(*) AS attempts,
+                    SUM(CASE WHEN x.status = 'Completed' THEN 1 ELSE 0 END) AS completed_attempts,
+                    MAX(CASE WHEN x.status = 'Completed' THEN x.final_score END) AS best_final
+             FROM (
+                 SELECT e.enrollment_id, e.status, cs.course_id,
+                        ROUND(SUM(g.score * a.weight_percent / 100) / 10, 1) AS final_score
+                 FROM Enrollment e
+                 JOIN ClassSection cs ON cs.section_id = e.section_id
+                 LEFT JOIN Assessment a ON a.section_id = cs.section_id
+                 LEFT JOIN Grade g ON g.enrollment_id = e.enrollment_id
+                                  AND g.assessment_id = a.assessment_id
+                 WHERE e.student_id = :sid
+                 GROUP BY e.enrollment_id, e.status, cs.course_id
+             ) x
+             GROUP BY x.course_id"
+        );
+        $stmt->execute([':sid' => $studentId]);
+
+        $retakeMaxPoint = max(0.0, SystemConfig::getFloat('retake_allowed_max_gpa', 2.0));
+        $scale = $pdo->query(
+            'SELECT min_score, max_score, grade_point FROM GradeScale ORDER BY min_score DESC'
+        )->fetchAll();
+
+        $out = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $best = $row['best_final'] !== null ? (float)$row['best_final'] : null;
+            $passed = $best !== null && $best >= $passThreshold;
+            $point = 0.0;
+            if ($best !== null) {
+                foreach ($scale as $band) {
+                    $min = (float)$band['min_score'];
+                    $max = (float)$band['max_score'];
+                    if ($best >= $min && ($best < $max || $max >= 10.0)) {
+                        $point = (float)$band['grade_point'];
+                        break;
+                    }
+                }
+            }
+            $out[(int)$row['course_id']] = [
+                'attempts'  => (int)$row['attempts'],
+                'completed' => (int)$row['completed_attempts'],
+                'best_final'=> $best,
+                'passed'    => $passed,
+                // Failed or ungraded records follow the university's retake rule.
+                'retake'    => !$passed && $point < $retakeMaxPoint,
+            ];
+        }
+        return $out;
+    }
+
+    /** Active (non-withdrawn) registrations for one semester. */
+    public static function activeEnrollments(PDO $pdo, string $studentId, int $semesterId): array {
+        if ($semesterId < 1) return [];
+        $stmt = $pdo->prepare(
+            "SELECT e.enrollment_id, e.section_id, cs.course_id, cs.section_code,
+                    cs.section_status, cs.status_note,
+                    cs.schedule, cs.study_days, cs.start_time, cs.end_time, cs.room,
+                    cs.min_enrollment, cs.max_enrollment, cs.capacity,
+                    c.course_code, c.course_name, c.credits,
+                    l.full_name AS lecturer_name
+             FROM Enrollment e
+             JOIN ClassSection cs ON cs.section_id = e.section_id
+             JOIN Course c ON c.course_id = cs.course_id
+             JOIN Lecturer l ON l.lecturer_id = cs.lecturer_id
+             WHERE e.student_id = :sid AND cs.semester_id = :sem AND e.status = 'Enrolled'
+             ORDER BY c.course_code"
+        );
+        $stmt->execute([':sid' => $studentId, ':sem' => $semesterId]);
+        return $stmt->fetchAll();
+    }
+
+    /**
+     * Whether one section can be chosen by the student right now. Mirrors the
+     * checks enforced by register() so the UI never promises an invalid action.
+     *
+     * @return array{ok:bool,reason:string,state:string}
+     */
+    public static function sectionAvailability(
+        array $section, array $activeSections, int $registeredCredits, int $maxCredits,
+        bool $periodOpen, bool $prereqPassed
+    ): array {
+        if (!$periodOpen) {
+            return ['ok' => false, 'reason' => 'Chưa mở đợt đăng ký', 'state' => 'closed'];
+        }
+        $status = (string)($section['section_status'] ?? '');
+        if ($status === 'Cancelled' || $status === 'Insufficient') {
+            return ['ok' => false, 'reason' => self::statusMeta($status)['label'], 'state' => 'blocked'];
+        }
+        if (!$prereqPassed) {
+            return ['ok' => false, 'reason' => 'Chưa đạt môn tiên quyết', 'state' => 'prereq'];
+        }
+        foreach ($activeSections as $mine) {
+            if ((int)$mine['section_id'] === (int)$section['section_id']) continue;
+            if (self::sectionsOverlap($section, $mine)) {
+                return [
+                    'ok' => false,
+                    'reason' => 'Trùng lịch với lớp ' . $mine['section_code'],
+                    'state' => 'conflict',
+                ];
+            }
+        }
+        if ($registeredCredits + (int)$section['credits'] > $maxCredits) {
+            return [
+                'ok' => false,
+                'reason' => 'Vượt giới hạn ' . $maxCredits . ' TC/học kỳ',
+                'state' => 'credits',
+            ];
+        }
+        $count = (int)($section['enrolled_count'] ?? 0);
+        $max = max(1, (int)($section['max_enrollment'] ?: ($section['capacity'] ?: 64)));
+        if ($count >= $max) {
+            return ['ok' => false, 'reason' => 'Lớp đã đủ sĩ số tối đa ' . $max, 'state' => 'full'];
+        }
+        return ['ok' => true, 'reason' => '', 'state' => 'ok'];
+    }
+
+    /**
+     * Unique courses the student can still register, each with its offered
+     * sections. Passed courses and courses already actively registered in the
+     * semester are removed; failed/incomplete courses stay when retake is
+     * permitted by policy.
+     *
+     * @return array{courses:array,active:array,results:array,credit:array}
+     */
+    public static function availableCourses(
+        PDO $pdo, string $studentId, int $semesterId, int $periodId, bool $periodOpen,
+        string $search = '', int $departmentId = 0
+    ): array {
+        $results = self::courseAcademicResults($pdo, $studentId);
+        $active  = self::activeEnrollments($pdo, $studentId, $semesterId);
+        $credit  = self::registrationSummary($pdo, $studentId, $semesterId);
+
+        $hidden = [];
+        foreach ($active as $mine) $hidden[(int)$mine['course_id']] = true;
+        foreach ($results as $courseId => $res) {
+            if ($res['passed'] || ($res['completed'] > 0 && !$res['retake'])) {
+                $hidden[(int)$courseId] = true;
+            }
+        }
+
+        if ($semesterId < 1) {
+            return ['courses' => [], 'active' => $active, 'results' => $results, 'credit' => $credit];
+        }
+
+        $hasMapping = false;
+        if ($periodId > 0) {
+            $qm = $pdo->prepare('SELECT COUNT(*) FROM RegistrationPeriodSection WHERE period_id = :pid');
+            $qm->execute([':pid' => $periodId]);
+            $hasMapping = (int)$qm->fetchColumn() > 0;
+        }
+
+        $sql = "SELECT cs.section_id, cs.course_id, cs.section_code, cs.section_status, cs.status_note,
+                       cs.schedule, cs.study_days, cs.start_time, cs.end_time, cs.room,
+                       cs.min_enrollment, cs.max_enrollment, cs.capacity,
+                       c.course_code, c.course_name, c.credits, c.description, c.category,
+                       c.department_id, c.prerequisite_course_id,
+                       d.department_name, l.full_name AS lecturer_name,
+                       (SELECT COUNT(*) FROM Enrollment e2
+                         WHERE e2.section_id = cs.section_id
+                           AND e2.status IN ('Enrolled','Completed')) AS enrolled_count
+                FROM ClassSection cs
+                JOIN Course c ON c.course_id = cs.course_id
+                JOIN Lecturer l ON l.lecturer_id = cs.lecturer_id
+                LEFT JOIN Department d ON d.department_id = c.department_id
+                JOIN Student s ON s.student_id = :sid
+                WHERE cs.semester_id = :sem
+                  AND cs.section_status <> 'Cancelled'
+                  AND c.is_active = 1
+                  AND s.major_id IS NOT NULL
+                  AND EXISTS (
+                        SELECT 1 FROM Curriculum cur
+                        JOIN CurriculumCourse cc ON cc.curriculum_id = cur.curriculum_id
+                        WHERE cur.major_id = s.major_id AND cur.admission_year = s.admission_year
+                          AND cc.course_id = cs.course_id
+                  )";
+        $params = [':sid' => $studentId, ':sem' => $semesterId];
+
+        if ($hasMapping) {
+            $sql .= ' AND EXISTS (
+                        SELECT 1 FROM RegistrationPeriodSection rps
+                        WHERE rps.period_id = :pid AND rps.section_id = cs.section_id
+                      )';
+            $params[':pid'] = $periodId;
+        }
+        $search = trim($search);
+        if ($search !== '') {
+            $sql .= ' AND (c.course_code LIKE :q1 OR c.course_name LIKE :q2 OR c.description LIKE :q3)';
+            $like = '%' . $search . '%';
+            $params[':q1'] = $like;
+            $params[':q2'] = $like;
+            $params[':q3'] = $like;
+        }
+        if ($departmentId > 0) {
+            $sql .= ' AND c.department_id = :dept';
+            $params[':dept'] = $departmentId;
+        }
+        $sql .= ' ORDER BY c.course_code ASC, cs.section_code ASC';
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+
+        $courses = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $courseId = (int)$row['course_id'];
+            if (isset($hidden[$courseId])) continue;
+
+            $prereqId = (int)($row['prerequisite_course_id'] ?? 0);
+            $prereqPassed = $prereqId < 1 || !empty($results[$prereqId]['passed']);
+
+            if (!isset($courses[$courseId])) {
+                $courses[$courseId] = [
+                    'course_id'    => $courseId,
+                    'course_code'  => $row['course_code'],
+                    'course_name'  => $row['course_name'],
+                    'credits'      => (int)$row['credits'],
+                    'description'  => (string)($row['description'] ?? ''),
+                    'category'     => (string)($row['category'] ?? ''),
+                    'department_name' => (string)($row['department_name'] ?? ''),
+                    'prereq_code'  => '',
+                    'prereq_passed'=> true,
+                    'sections'     => [],
+                    'section_count'=> 0,
+                    'open_sections'=> 0,
+                    'status'       => 'available',
+                    'status_label' => 'Có thể đăng ký',
+                    'status_class' => 'green',
+                ];
+                if ($prereqId > 0) {
+                    $pq = $pdo->prepare('SELECT course_code FROM Course WHERE course_id = :cid LIMIT 1');
+                    $pq->execute([':cid' => $prereqId]);
+                    $courses[$courseId]['prereq_code'] = (string)$pq->fetchColumn();
+                }
+            }
+            $courses[$courseId]['prereq_passed'] = $courses[$courseId]['prereq_passed'] && $prereqPassed;
+
+            $slots = self::sectionSlots($row);
+            $dayText = implode(', ', array_unique(array_map(
+                static fn($slot) => self::dayLabel((int)$slot['day']),
+                $slots
+            )));
+            $timeText = $slots
+                ? substr($slots[0]['start'], 0, 5) . '–' . substr($slots[0]['end'], 0, 5)
+                : '';
+            $count = (int)$row['enrolled_count'];
+            $capacity = self::capacityState($row, $count);
+            $meta = self::statusMeta((string)$row['section_status']);
+            $availability = self::sectionAvailability(
+                $row, $active, (int)$credit['registered'], (int)$credit['max'], $periodOpen, $prereqPassed
+            );
+
+            $courses[$courseId]['sections'][] = [
+                'section_id'      => (int)$row['section_id'],
+                'section_code'    => $row['section_code'],
+                'lecturer_name'   => $row['lecturer_name'],
+                'day_text'        => $dayText !== '' ? $dayText : 'Chưa xếp lịch',
+                'time_text'       => $timeText,
+                'room'            => (string)($row['room'] ?? ''),
+                'enrolled_count'  => $count,
+                'max_enrollment'  => max(1, (int)($row['max_enrollment'] ?: ($row['capacity'] ?: 64))),
+                'min_enrollment'  => (int)$row['min_enrollment'],
+                'threshold'       => $capacity['threshold'],
+                'capacity_short'  => $capacity['short'],
+                'capacity_pct'    => $capacity['pct'],
+                'section_status'  => (string)$row['section_status'],
+                'status_label'    => $meta['label'],
+                'status_bg'       => $meta['bg'],
+                'status_fg'       => $meta['fg'],
+                'eligible'        => $availability['ok'],
+                'reason'          => $availability['reason'],
+                'eligibility_state' => $availability['state'],
+            ];
+            $courses[$courseId]['section_count']++;
+            if ($availability['ok']) $courses[$courseId]['open_sections']++;
+        }
+
+        foreach ($courses as &$course) {
+            $sections = $course['sections'];
+            if (!$periodOpen) {
+                $course['status'] = 'closed';
+                $course['status_label'] = 'Chưa mở đợt';
+                $course['status_class'] = 'gray';
+                continue;
+            }
+            if ($course['open_sections'] > 0) {
+                $course['status'] = 'available';
+                $course['status_label'] = 'Có thể đăng ký';
+                $course['status_class'] = 'green';
+                continue;
+            }
+            if (!$course['prereq_passed']) {
+                $course['status'] = 'prereq';
+                $course['status_label'] = 'Thiếu tiên quyết';
+                $course['status_class'] = 'gold';
+                continue;
+            }
+            $allFull = true;
+            foreach ($sections as $sectionRow) {
+                if ($sectionRow['eligibility_state'] !== 'full') { $allFull = false; break; }
+            }
+            if ($sections && $allFull) {
+                $course['status'] = 'full';
+                $course['status_label'] = 'Đã đầy';
+                $course['status_class'] = 'red';
+            } else {
+                $course['status'] = 'blocked';
+                $course['status_label'] = 'Không khả dụng';
+                $course['status_class'] = 'gray';
+            }
+        }
+        unset($course);
+
+        return [
+            'courses' => array_values($courses),
+            'active'  => $active,
+            'results' => $results,
+            'credit'  => $credit,
+        ];
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Semester credit policy
+    // ─────────────────────────────────────────────────────────
+
+    /**
+     * Effective min/max registered credits for a student in a semester.
+     * A per-student, per-semester exception overrides the global policy.
+     */
+    public static function creditPolicy(PDO $pdo, string $studentId, int $semesterId): array {
+        $min = max(0, SystemConfig::getInt('registration_min_credits', 14));
+        $max = max(1, SystemConfig::getInt('registration_max_credits', 24));
+        if ($max < $min) $max = $min;
+
+        $reason = null;
+        $hasException = false;
+        if ($semesterId > 0) {
+            $q = $pdo->prepare(
+                'SELECT min_credits, max_credits, reason FROM RegistrationCreditException
+                 WHERE student_id = :sid AND semester_id = :sem LIMIT 1'
+            );
+            $q->execute([':sid' => $studentId, ':sem' => $semesterId]);
+            if ($row = $q->fetch()) {
+                $hasException = true;
+                if ($row['min_credits'] !== null) $min = (int)$row['min_credits'];
+                if ($row['max_credits'] !== null) $max = (int)$row['max_credits'];
+                $reason = $row['reason'];
+                if ($max < $min) $max = $min;
+            }
+        }
+        return [
+            'min' => $min, 'max' => $max,
+            'has_exception' => $hasException, 'exception_reason' => $reason,
+        ];
+    }
+
+    /** Credits currently registered by a student in a semester. */
+    public static function registeredCredits(PDO $pdo, string $studentId, int $semesterId, ?int $excludeSectionId = null): int {
+        if ($semesterId < 1) return 0;
+        $sql = "SELECT COALESCE(SUM(c.credits), 0)
+                FROM Enrollment e
+                JOIN ClassSection cs ON cs.section_id = e.section_id
+                JOIN Course c ON c.course_id = cs.course_id
+                WHERE e.student_id = :sid AND cs.semester_id = :sem
+                  AND e.status IN ('Enrolled','Completed')";
+        $params = [':sid' => $studentId, ':sem' => $semesterId];
+        if ($excludeSectionId !== null) {
+            $sql .= ' AND cs.section_id <> :ex';
+            $params[':ex'] = $excludeSectionId;
+        }
+        $q = $pdo->prepare($sql);
+        $q->execute($params);
+        return (int)$q->fetchColumn();
+    }
+
+    /** Full credit picture used by student/admin UIs. */
+    public static function registrationSummary(PDO $pdo, string $studentId, int $semesterId, ?int $excludeSectionId = null): array {
+        $policy = self::creditPolicy($pdo, $studentId, $semesterId);
+        $registered = self::registeredCredits($pdo, $studentId, $semesterId, $excludeSectionId);
+        return [
+            'min' => $policy['min'],
+            'max' => $policy['max'],
+            'registered' => $registered,
+            'remaining' => max(0, $policy['max'] - $registered),
+            'below_min' => $registered > 0 && $registered < $policy['min'],
+            'below_min_gap' => max(0, $policy['min'] - $registered),
+            'over_max' => $registered > $policy['max'],
+            'has_exception' => $policy['has_exception'],
+            'exception_reason' => $policy['exception_reason'],
+        ];
+    }
+
+    /** Create/update an admin-authorized credit-limit exception. */
+    public static function saveCreditException(
+        PDO $pdo, string $studentId, int $semesterId, ?int $min, ?int $max,
+        string $reason, int $accountId
+    ): array {
+        if ($studentId === '' || $semesterId < 1) {
+            return ['ok' => false, 'message' => 'Vui lòng chọn sinh viên và học kỳ.'];
+        }
+        $reason = trim($reason);
+        if ($reason === '') {
+            return ['ok' => false, 'message' => 'Vui lòng nhập lý do ngoại lệ.'];
+        }
+        if ($min !== null && ($min < 0 || $min > 60)) {
+            return ['ok' => false, 'message' => 'Tín chỉ tối thiểu phải từ 0 đến 60.'];
+        }
+        if ($max !== null && ($max < 1 || $max > 60)) {
+            return ['ok' => false, 'message' => 'Tín chỉ tối đa phải từ 1 đến 60.'];
+        }
+        if ($min !== null && $max !== null && $max < $min) {
+            return ['ok' => false, 'message' => 'Tín chỉ tối đa phải lớn hơn hoặc bằng tối thiểu.'];
+        }
+        $q = $pdo->prepare('SELECT 1 FROM Student WHERE student_id=:sid LIMIT 1');
+        $q->execute([':sid' => $studentId]);
+        if (!$q->fetch()) return ['ok' => false, 'message' => 'Sinh viên không tồn tại.'];
+        $q = $pdo->prepare('SELECT 1 FROM Semester WHERE semester_id=:sem LIMIT 1');
+        $q->execute([':sem' => $semesterId]);
+        if (!$q->fetch()) return ['ok' => false, 'message' => 'Học kỳ không tồn tại.'];
+
+        $old = $pdo->prepare('SELECT * FROM RegistrationCreditException WHERE student_id=:sid AND semester_id=:sem LIMIT 1');
+        $old->execute([':sid' => $studentId, ':sem' => $semesterId]);
+        $oldRow = $old->fetch();
+
+        $pdo->prepare(
+            'INSERT INTO RegistrationCreditException (student_id, semester_id, min_credits, max_credits, reason, approved_by)
+             VALUES (:sid, :sem, :mn, :mx, :reason, :by)
+             ON DUPLICATE KEY UPDATE min_credits=VALUES(min_credits), max_credits=VALUES(max_credits),
+                                     reason=VALUES(reason), approved_by=VALUES(approved_by)'
+        )->execute([
+            ':sid' => $studentId, ':sem' => $semesterId,
+            ':mn' => $min, ':mx' => $max, ':reason' => $reason, ':by' => $accountId,
+        ]);
+        AcademicAlertService::writeAuditLog(
+            $pdo, $accountId, $oldRow ? 'UPDATE_CREDIT_EXCEPTION' : 'CREATE_CREDIT_EXCEPTION',
+            'RegistrationCreditException', $studentId . ':' . $semesterId,
+            $oldRow ? json_encode($oldRow, JSON_UNESCAPED_UNICODE) : null,
+            json_encode(['min' => $min, 'max' => $max, 'reason' => $reason], JSON_UNESCAPED_UNICODE)
+        );
+        return ['ok' => true, 'message' => 'Đã lưu ngoại lệ tín chỉ cho sinh viên ' . $studentId . '.'];
+    }
+
+    public static function deleteCreditException(PDO $pdo, int $exceptionId, int $accountId): array {
+        $q = $pdo->prepare('SELECT * FROM RegistrationCreditException WHERE exception_id=:id LIMIT 1');
+        $q->execute([':id' => $exceptionId]);
+        $row = $q->fetch();
+        if (!$row) return ['ok' => false, 'message' => 'Không tìm thấy ngoại lệ.'];
+        $pdo->prepare('DELETE FROM RegistrationCreditException WHERE exception_id=:id')->execute([':id' => $exceptionId]);
+        AcademicAlertService::writeAuditLog(
+            $pdo, $accountId, 'DELETE_CREDIT_EXCEPTION', 'RegistrationCreditException',
+            $row['student_id'] . ':' . $row['semester_id'], json_encode($row, JSON_UNESCAPED_UNICODE), null
+        );
+        return ['ok' => true, 'message' => 'Đã xóa ngoại lệ tín chỉ.'];
     }
 
     // ─────────────────────────────────────────────────────────
@@ -516,6 +933,10 @@ class RegistrationService {
                 if (!$qm->fetch()) throw new RuntimeException('Ngành của bạn không thuộc đợt đăng ký này.');
             }
 
+            // Serialise concurrent registrations for this student as well.
+            $lockStudent = $pdo->prepare('SELECT student_id FROM Student WHERE student_id = :sid FOR UPDATE');
+            $lockStudent->execute([':sid' => $studentId]);
+
             $hasSectionMapping = (int)$pdo->query(
                 'SELECT COUNT(*) FROM registrationperiodsection WHERE period_id=' . (int)$period['period_id']
             )->fetchColumn() > 0;
@@ -559,13 +980,16 @@ class RegistrationService {
             $qc->execute([':sid' => $studentId, ':cid' => (int)$section['course_id']]);
             if (!$qc->fetch()) throw new RuntimeException('Môn học không thuộc chương trình đào tạo của bạn.');
 
-            // Already completed this course?
-            $qcomp = $pdo->prepare(
-                "SELECT 1 FROM Enrollment e JOIN ClassSection cs ON cs.section_id=e.section_id
-                 WHERE e.student_id=:sid AND cs.course_id=:cid AND e.status='Completed' LIMIT 1"
-            );
-            $qcomp->execute([':sid' => $studentId, ':cid' => (int)$section['course_id']]);
-            if ($qcomp->fetch()) throw new RuntimeException('Bạn đã hoàn thành môn ' . $section['course_code'] . '.');
+            // Passing an official result hides the course; a failed/incomplete
+            // record stays retakeable when policy allows it.
+            $results      = self::courseAcademicResults($pdo, $studentId);
+            $courseResult = $results[(int)$section['course_id']] ?? null;
+            if ($courseResult && $courseResult['passed']) {
+                throw new RuntimeException('Bạn đã hoàn thành môn ' . $section['course_code'] . '.');
+            }
+            if ($courseResult && $courseResult['completed'] > 0 && !$courseResult['retake']) {
+                throw new RuntimeException('Môn ' . $section['course_code'] . ' chưa đủ điều kiện học lại theo quy chế.');
+            }
 
             // Already taking the course in this semester (another section)?
             $qsame = $pdo->prepare(
@@ -597,10 +1021,14 @@ class RegistrationService {
                      JOIN Grade g ON g.enrollment_id=e.enrollment_id AND g.assessment_id=a.assessment_id
                      WHERE e.student_id=:sid AND cs.course_id=:pre AND e.status='Completed' AND g.score IS NOT NULL
                      GROUP BY e.enrollment_id
-                     HAVING ROUND(SUM(g.score * a.weight_percent / 100) / 10, 1) >= 4.0
+                     HAVING ROUND(SUM(g.score * a.weight_percent / 100) / 10, 1) >= :thr
                      LIMIT 1"
                 );
-                $qpre->execute([':sid' => $studentId, ':pre' => (int)$section['prerequisite_course_id']]);
+                $qpre->execute([
+                    ':sid' => $studentId,
+                    ':pre' => (int)$section['prerequisite_course_id'],
+                    ':thr' => self::passingScoreThreshold($pdo),
+                ]);
                 if (!$qpre->fetch()) {
                     $qpn = $pdo->prepare('SELECT course_code FROM Course WHERE course_id=:id LIMIT 1');
                     $qpn->execute([':id' => (int)$section['prerequisite_course_id']]);
@@ -624,6 +1052,17 @@ class RegistrationService {
                     throw new RuntimeException('Trùng lịch học với lớp ' . $other['section_code']
                         . ' (' . $other['course_code'] . ').');
                 }
+            }
+
+            // Semester credit limit (per-student exception overrides the policy).
+            $credit = self::registrationSummary($pdo, $studentId, (int)$section['semester_id'], $sectionId);
+            $newTotal = $credit['registered'] + (int)$section['credits'];
+            if ($newTotal > $credit['max']) {
+                throw new RuntimeException(
+                    'Vượt giới hạn tín chỉ: đã đăng ký ' . $credit['registered'] . ' TC, môn này '
+                    . (int)$section['credits'] . ' TC, tối đa ' . $credit['max']
+                    . ' TC/học kỳ. Hãy hủy bớt môn hoặc liên hệ Phòng Đào tạo.'
+                );
             }
 
             // Capacity check while holding the section lock.

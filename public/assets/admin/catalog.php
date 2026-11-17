@@ -136,7 +136,7 @@ $courseTotal = (int)$pdo->query('SELECT COUNT(*) FROM Course WHERE is_active=TRU
 $unmapped    = (int)$pdo->query('SELECT COUNT(*) FROM Student WHERE major_id IS NULL AND status=\'Active\'')->fetchColumn();
 
 $warnCount  = (int)$pdo->query("SELECT COUNT(*) FROM AcademicWarning WHERE status='Active' AND is_read=FALSE")->fetchColumn();
-$pageTitle  = 'Danh mục Bộ môn & Ngành';
+$pageTitle  = 'Ngành & Bộ môn';
 $activePage = 'catalog';
 $breadcrumb = 'Quản trị › Danh mục đào tạo';
 require __DIR__ . '/_layout.php';

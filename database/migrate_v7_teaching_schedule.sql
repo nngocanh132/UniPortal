@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS TeachingSchedule (
     CONSTRAINT ck_schedule_time CHECK (end_time > start_time),
     CONSTRAINT ck_schedule_dates CHECK (effective_end >= effective_start),
     CONSTRAINT ck_schedule_dow CHECK (day_of_week BETWEEN 1 AND 7)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ── 2. Extend AttendanceSession ─────────────────────────────
 DELIMITER $$
@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS ScheduleChangeRequest (
     CONSTRAINT ck_scr_time CHECK (
         proposed_end_time IS NULL OR proposed_start_time IS NULL OR proposed_end_time > proposed_start_time
     )
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- One pending request of each type per session
 -- (MySQL/MariaDB cannot use partial indexes; enforced in application logic.)

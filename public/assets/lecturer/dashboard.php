@@ -89,10 +89,10 @@ function fmt_time(string $t): string { return substr($t, 0, 5); }
         <?php endif; ?>
     </div>
 
-    <!-- Bài tập đang hỗ -->
+    <!-- Bài tập đang mở -->
     <div class="lcard lec-kpi">
         <div class="lec-kpi__top">
-            <span class="lec-kpi__label">Bài tập đang hỗ</span>
+            <span class="lec-kpi__label">Bài tập đang mở</span>
             <span class="lec-kpi__icon lec-kpi__icon--blue">
                 <img src="../img/db-nav-grades.svg" alt="" />
             </span>

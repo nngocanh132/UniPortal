@@ -36,6 +36,13 @@ $nav = [
 if (!function_exists('h')) {
     function h($v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
 }
+
+if (isset($_GET['mark_all_notif']) && !empty($_SESSION['account_id'])) {
+    require_once dirname(__DIR__, 3) . '/src/src/services/NotificationService.php';
+    NotificationService::markAllRead((int)$_SESSION['account_id']);
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
 ?>
 <!DOCTYPE html>
 <html lang="vi">
@@ -45,11 +52,11 @@ if (!function_exists('h')) {
     <title><?= h($pageTitle) ?> – UniPortal Giảng viên</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="stylesheet" href="<?= $CSS ?>lecturer.css" />
+    <link rel="stylesheet" href="<?= $CSS ?>lecturer.css?v=<?= @filemtime(__DIR__ . '/../css/lecturer.css') ?: 0 ?>" />
     <?php if (!empty($extraCss)): ?>
-    <link rel="stylesheet" href="<?= $CSS ?><?= h($extraCss) ?>" />
+    <link rel="stylesheet" href="<?= $CSS ?><?= h($extraCss) ?>?v=<?= @filemtime(__DIR__ . '/../css/' . $extraCss) ?: 0 ?>" />
     <?php endif; ?>
-    <link rel="stylesheet" href="<?= $CSS ?>system.css" />
+    <link rel="stylesheet" href="<?= $CSS ?>system.css?v=<?= @filemtime(__DIR__ . '/../css/system.css') ?: 0 ?>" />
 </head>
 <body>
 <div class="lec-layout">
@@ -75,35 +82,32 @@ if (!function_exists('h')) {
     </nav>
 
     <div class="lec-sidebar__footer">
-        <div class="lec-sidebar__system-info">
-            <span class="lec-sidebar__system-dot"></span>
-            <div class="lec-sidebar__system-text">
-                <strong>Hệ thống UIS ĐHQGHN</strong><br/>
-                Máy chủ: Đầy sáng
+        <div class="sidebar-profile">
+            <span class="sidebar-profile__avatar"><?= h($initials) ?></span>
+            <div class="sidebar-profile__text">
+                <div class="sidebar-profile__name"><?= h($lecName) ?></div>
+                <div class="sidebar-profile__role"><?= $lecCode !== '' ? 'Khoa ' . h($lecCode) : 'Giảng viên' ?></div>
             </div>
+            <a href="?logout=1" class="sidebar-profile__logout" title="Đăng xuất" aria-label="Đăng xuất">
+                <img src="<?= $IMG ?>db-icon-logout.svg" alt="" />
+            </a>
         </div>
-        <a href="?logout=1" class="lec-sidebar__logout">
-            <img src="<?= $IMG ?>db-icon-logout.svg" alt="" />
-            Đăng xuất tài khoản
-        </a>
     </div>
 </aside>
 
 <!-- ═══════════════════ HEADER ════════════════════════════ -->
 <header class="lec-header">
-    <div class="lec-header__left">
+    <div class="lec-header__left" style="display:flex;align-items:center;gap:14px;min-width:0;">
         <button class="lec-hamburger" id="lecHamburger" aria-label="Menu">
             <span></span><span></span><span></span>
         </button>
         <img class="lec-header__logo"
              src="<?= $IMG ?>db-logo-vnuis-sidebar.png"
              alt="IIS" />
-        <div class="lec-header__divider"></div>
-        <div class="lec-header__breadcrumb">
-            <span class="lec-header__breadcrumb-top">Cổng Giảng viên</span>
-            <span class="lec-header__breadcrumb-bottom">Trường Quốc tế – ĐHQGHN</span>
+        <div class="lec-header__context">
+            <div class="lec-header__context-title"><?= h($pageTitle) ?></div>
+            <div class="lec-header__context-sub">Cổng Giảng viên</div>
         </div>
-        <div class="lec-header__divider"></div>
         <div class="lec-header__search">
             <img class="s-icon" src="<?= $IMG ?>icon-search.svg" alt="" />
             <input type="search" placeholder="Tìm sinh viên, MSSV, mã lớp..." aria-label="Tìm kiếm" />
@@ -116,51 +120,81 @@ if (!function_exists('h')) {
         $lecNotifCount = NotificationService::unreadCount((int)($_SESSION['account_id'] ?? 0));
         $lecNotifItems = NotificationService::getRecent((int)($_SESSION['account_id'] ?? 0), 5);
         $lecBellBadge  = max($warnCount, $lecNotifCount);
-        if (isset($_GET['mark_all_notif'])) {
-            NotificationService::markAllRead((int)($_SESSION['account_id'] ?? 0));
-            header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
-            exit;
-        }
         ?>
-        <div style="position:relative;">
-        <button class="lec-header__bell" aria-label="Thông báo"
-                onclick="var d=document.getElementById('lecNotifDrop');d.style.display=d.style.display==='none'?'block':'none';">
+        <div id="lecNotifWrap">
+        <button class="lec-header__bell" aria-label="Thông báo" aria-expanded="false"
+                onclick="this.setAttribute('aria-expanded', document.getElementById('lecNotifDrop').classList.toggle('show'));">
             <img src="<?= $IMG ?>db-icon-bell.svg" alt="" />
             <?php if ($lecBellBadge > 0): ?>
             <span class="hbadge"><?= min($lecBellBadge, 9) ?></span>
             <?php endif; ?>
         </button>
-        <div id="lecNotifDrop" style="display:none;position:absolute;right:0;top:44px;width:290px;background:#fff;
-             border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.15);z-index:999;overflow:hidden;">
-            <div style="padding:10px 14px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;">
-                <span style="font-weight:700;font-size:13px;">Thông báo</span>
-                <?php if ($lecBellBadge > 0): ?>
-                <a href="?mark_all_notif=1" style="font-size:11px;color:#3b82f6;text-decoration:none;">Đánh dấu đã đọc</a>
+        <div id="lecNotifDrop" class="notif-panel">
+            <div class="notif-panel__head">
+                <span class="notif-panel__title">Thông báo</span>
+                <?php if ($lecNotifCount > 0): ?>
+                <a href="?mark_all_notif=1" class="notif-panel__action">Đánh dấu đã đọc</a>
                 <?php endif; ?>
             </div>
-            <?php if (empty($lecNotifItems)): ?>
-            <div style="padding:18px;text-align:center;color:#94a3b8;font-size:12px;">Không có thông báo mới.</div>
+            <?php if (empty($lecNotifItems) && !$warnCount): ?>
+            <div class="notif-panel__empty">Không có thông báo mới.</div>
             <?php else: ?>
-            <div style="max-height:220px;overflow-y:auto;">
+            <div class="notif-panel__list">
+                <?php if ($warnCount > 0): ?>
+                <a class="notif-item notif-item--unread" href="warnings.php">
+                    <div class="notif-item__title"><?= (int)$warnCount ?> sinh viên cần can thiệp</div>
+                    <div class="notif-item__time">Xem chi tiết</div>
+                </a>
+                <?php endif; ?>
                 <?php foreach ($lecNotifItems as $n): ?>
-                <div style="padding:10px 14px;border-bottom:1px solid #f8fafc;background:<?= !$n['is_read']?'#f8fbff':'#fff' ?>;">
-                    <div style="font-size:12px;font-weight:<?= !$n['is_read']?'700':'400' ?>;color:#001634;"><?= htmlspecialchars($n['title']) ?></div>
-                    <div style="font-size:10px;color:#94a3b8;"><?= date('d/m H:i', strtotime($n['created_at'])) ?></div>
+                <div class="notif-item<?= !$n['is_read'] ? ' notif-item--unread' : '' ?>">
+                    <div class="notif-item__title"><?= htmlspecialchars($n['title']) ?></div>
+                    <?php if ($n['body']): ?>
+                    <div class="notif-item__body"><?= htmlspecialchars(mb_strimwidth($n['body'], 0, 60, '…')) ?></div>
+                    <?php endif; ?>
+                    <div class="notif-item__time"><?= date('d/m H:i', strtotime($n['created_at'])) ?></div>
                 </div>
                 <?php endforeach; ?>
             </div>
             <?php endif; ?>
+            <div class="notif-panel__footer">
+                <a href="warnings.php">Xem cảnh báo &amp; can thiệp →</a>
+            </div>
+        </div>
         </div>
         <button class="lec-header__profile" aria-haspopup="true">
             <span class="hav"><?= h($initials) ?></span>
             <div>
                 <div class="hname"><?= h($lecName) ?></div>
-                <div class="hrole">Khoa <?= h($lecCode) ?> – Bộ môn</div>
+                <div class="hrole"><?= $lecCode !== '' ? 'Khoa ' . h($lecCode) : 'Giảng viên' ?></div>
             </div>
             <img class="hcaret" src="<?= $IMG ?>db-icon-caret.svg" alt="" />
         </button>
     </div>
 </header>
+<script>
+(function () {
+    document.addEventListener('click', function (e) {
+        var drop = document.getElementById('lecNotifDrop');
+        var wrap = document.getElementById('lecNotifWrap');
+        if (!drop || !wrap || !drop.classList.contains('show')) return;
+        if (!wrap.contains(e.target)) {
+            drop.classList.remove('show');
+            var bell = wrap.querySelector('.lec-header__bell');
+            if (bell) bell.setAttribute('aria-expanded', 'false');
+        }
+    });
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Escape') return;
+        var drop = document.getElementById('lecNotifDrop');
+        if (!drop || !drop.classList.contains('show')) return;
+        drop.classList.remove('show');
+        var wrap = document.getElementById('lecNotifWrap');
+        var bell = wrap ? wrap.querySelector('.lec-header__bell') : null;
+        if (bell) { bell.setAttribute('aria-expanded', 'false'); bell.focus(); }
+    });
+})();
+</script>
 
 <!-- ═══════════════════ MAIN ══════════════════════════════ -->
 <main class="lec-main" id="lecMain">

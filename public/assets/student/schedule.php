@@ -2,10 +2,14 @@
 /**
  * UniPortal – Thời khóa biểu (Student)
  *
- * Read-only view of the official timetable. Only confirmed sessions are
- * shown as scheduled; cancelled sessions stay visible with a "Đã hủy"
- * marker and approved make-up sessions appear as new entries. Pending
- * lecturer requests are never displayed here.
+ * Two sections only:
+ *   1. Buổi học kế tiếp – next official session (cancelled excluded)
+ *   2. Lịch theo tuần chính thức – week calendar with date/week navigation
+ *
+ * Only confirmed sessions from AttendanceSession are shown. Cancelled
+ * sessions stay visible with a marker; approved make-up sessions appear as
+ * their own entries. No examination dates are fabricated: the exam filter
+ * shows an explicit empty state because the database holds no exam schedule.
  */
 $root = dirname(__DIR__, 3);
 require_once $root . '/src/src/helpers/auth.php';
@@ -27,38 +31,115 @@ $semesters = $pdo->query(
      FROM Semester ORDER BY start_date DESC'
 )->fetchAll();
 
-$selSem = null;
-foreach ($semesters as $sem) { if ((int)$sem['semester_id'] === $semId) { $selSem = $sem; break; } }
-
 $sessions = $semId ? TeachingSchedule::getStudentTimetable($studentId, $semId) : [];
-$weekly   = $semId ? TeachingSchedule::getStudentWeeklyPattern($studentId, $semId) : [];
+// Synthetic rows (negative ids) are unconfirmed plans, not official sessions.
+$sessions = array_values(array_filter($sessions, static fn($s) => (int)$s['session_id'] > 0));
 
-$today = date('Y-m-d');
-$view  = $_GET['view'] ?? 'upcoming';
-if (!in_array($view, ['upcoming', 'past', 'all'], true)) $view = 'upcoming';
+$filter = $_GET['filter'] ?? 'class';
+if (!in_array($filter, ['class', 'exam', 'all'], true)) $filter = 'class';
 
-$visible = array_values(array_filter($sessions, function ($s) use ($view, $today) {
-    if ($view === 'all') return true;
-    if ($view === 'past') return $s['session_date'] < $today;
-    return $s['session_date'] >= $today;
-}));
+$selectedDate = $_GET['date'] ?? date('Y-m-d');
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $selectedDate) || !strtotime($selectedDate)) {
+    $selectedDate = date('Y-m-d');
+}
 
-$upcomingCount = count(array_filter($sessions, fn($s) => $s['session_date'] >= $today && $s['status'] !== 'Cancelled'));
-$cancelledCount = count(array_filter($sessions, fn($s) => $s['status'] === 'Cancelled'));
-$makeupCount = count(array_filter($sessions, fn($s) => $s['session_type'] === 'Makeup' && $s['status'] !== 'Cancelled'));
+$weekStart = (new DateTimeImmutable($selectedDate))->modify('monday this week');
+$weekDates = [];
+for ($i = 0; $i < 7; $i++) {
+    $weekDates[] = $weekStart->modify("+$i day")->format('Y-m-d');
+}
+$weekStartStr = $weekDates[0];
+$weekEndStr   = $weekDates[6];
+
+$focusSession = (int)($_GET['session'] ?? 0);
+$nowStamp     = time();
+$today        = date('Y-m-d');
 
 $nextSession = null;
 foreach ($sessions as $s) {
-    if ($s['session_date'] >= $today && $s['status'] !== 'Cancelled') { $nextSession = $s; break; }
+    if ($s['status'] === 'Cancelled') continue;
+    if (strtotime($s['session_date'] . ' ' . $s['start_time']) < $nowStamp) continue;
+    $nextSession = $s;
+    break;
 }
 
-$byDay = [];
-foreach ($weekly as $w) { $byDay[(int)$w['day_of_week']][] = $w; }
+$byDate = [];
+foreach ($sessions as $s) {
+    if ($s['session_date'] < $weekStartStr || $s['session_date'] > $weekEndStr) continue;
+    $byDate[$s['session_date']][] = $s;
+}
+
+// One table, two session rows: Sáng (starts before 13:00) and Chiều
+// (13:00 onward). Cards always show the exact times stored in the database.
+$sessionOf = static function (array $s): string {
+    return substr($s['start_time'], 0, 5) < '13:00' ? 'morning' : 'afternoon';
+};
+$daySchedule = [];
+foreach ($weekDates as $d) {
+    $daySchedule[$d] = ['morning' => [], 'afternoon' => []];
+}
+foreach ($byDate as $d => $rows) {
+    foreach ($rows as $r) {
+        $daySchedule[$d][$sessionOf($r)][] = $r;
+    }
+}
+foreach ($daySchedule as &$daySlots) {
+    foreach ($daySlots as &$slotRows) {
+        usort($slotRows, static fn($a, $b) => strcmp($a['start_time'], $b['start_time']));
+    }
+    unset($slotRows);
+}
+unset($daySlots);
+
+$attLabels = ['Present' => 'Có mặt', 'Absent' => 'Vắng', 'Late' => 'Đi muộn', 'Excused' => 'Có phép'];
+
+$weekCount   = 0;
+$cancelledInWeek = 0;
+foreach ($byDate as $rows) {
+    foreach ($rows as $r) {
+        $weekCount++;
+        if ($r['status'] === 'Cancelled') $cancelledInWeek++;
+    }
+}
 
 function h($v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
 
 $dayNames = ['1' => 'Thứ 2', '2' => 'Thứ 3', '3' => 'Thứ 4', '4' => 'Thứ 5', '5' => 'Thứ 6', '6' => 'Thứ 7', '7' => 'Chủ nhật'];
-$dayShort = ['Mon' => 'T2', 'Tue' => 'T3', 'Wed' => 'T4', 'Thu' => 'T5', 'Fri' => 'T6', 'Sat' => 'T7', 'Sun' => 'CN'];
+
+$navQs = function (array $over) use ($semId, $filter, $selectedDate): string {
+    return '?' . http_build_query(array_merge(
+        ['sem' => $semId, 'filter' => $filter, 'date' => $selectedDate],
+        $over
+    ));
+};
+
+$renderCard = function (array $s, string $d) use ($navQs, $focusSession, $attLabels): string {
+    $isCancelled = $s['status'] === 'Cancelled';
+    $isMakeup    = $s['session_type'] === 'Makeup';
+    $attStatus   = (string)($s['attendance_status'] ?? '');
+    $sid         = (int)$s['session_id'];
+    ob_start(); ?>
+    <a id="session-<?= $sid ?>"
+       class="sch-card<?= $isCancelled ? ' is-cancelled' : '' ?><?= $isMakeup && !$isCancelled ? ' is-makeup' : '' ?><?= $focusSession === $sid ? ' is-focus' : '' ?>"
+       href="<?= h($navQs(['date' => $d, 'session' => $sid])) ?>#session-<?= $sid ?>">
+        <div class="sch-card__name"><?= h($s['course_name']) ?></div>
+        <div class="sch-card__line"><?= h($s['course_code']) ?> · Lớp <?= h($s['section_code']) ?></div>
+        <div class="sch-card__time">
+            <?= substr($s['start_time'], 0, 5) ?>–<?= substr($s['end_time'], 0, 5) ?>
+            <?= $isCancelled ? ' · Đã hủy' : ($isMakeup ? ' · Học bù' : '') ?>
+        </div>
+        <?php if ($s['room']): ?>
+        <div class="sch-card__line">Phòng: <?= h($s['room']) ?></div>
+        <?php endif; ?>
+        <?php if ($s['lecturer_name']): ?>
+        <div class="sch-card__line">GV: <?= h($s['lecturer_name']) ?></div>
+        <?php endif; ?>
+        <?php if ($attStatus !== '' && isset($attLabels[$attStatus])): ?>
+        <div class="sch-card__line">Điểm danh: <?= h($attLabels[$attStatus]) ?></div>
+        <?php endif; ?>
+    </a>
+    <?php return (string)ob_get_clean();
+};
 
 $pageTitle  = 'Thời khóa biểu';
 $activePage = 'schedule';
@@ -68,223 +149,198 @@ $warningCnt = StudentModel::getUnreadWarningCount($studentId);
 require_once __DIR__ . '/../partials/layout.php';
 ?>
 
-<div style="display:flex;justify-content:flex-end;flex-wrap:wrap;gap:12px;margin-bottom:14px;">
-    <a href="registration.php" style="display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:9px;
-       background:#fff;border:1px solid #e2e8f0;color:#334155;font-size:13px;font-weight:600;text-decoration:none;">
-        📝 Đăng ký môn học
-    </a>
-</div>
+<style>
+.sch-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+.sch-toolbar__group{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.sch-btn{display:inline-flex;align-items:center;justify-content:center;gap:5px;height:34px;padding:0 12px;
+    border-radius:8px;background:#fff;border:1px solid #e2e8f0;color:#334155;font-size:12.5px;font-weight:600;
+    text-decoration:none;cursor:pointer;}
+.sch-btn.is-active{background:#102b50;border-color:#102b50;color:#fff;}
+.sch-tab{padding:6px 12px;border-radius:20px;border:1px solid #e2e8f0;background:#fff;color:#475569;
+    font-size:12px;font-weight:600;text-decoration:none;}
+.sch-tab.is-active{background:#102b50;border-color:#102b50;color:#fff;}
+.sch-table-wrap{overflow-x:auto;}
+.sch-table{width:100%;min-width:1000px;border-collapse:collapse;table-layout:fixed;background:#fff;}
+.sch-table th,.sch-table td{border:1px solid #dbe3ec;vertical-align:top;}
+.sch-table thead th{background:#f1f5f9;color:#334155;font-size:11.5px;font-weight:800;
+    text-align:center;padding:8px 6px;line-height:1.3;}
+.sch-table thead th.sch-table__ca{width:104px;background:#fef6e4;color:#92400e;}
+.sch-table__date{display:block;font-size:10px;font-weight:600;color:#94a3b8;margin-top:1px;}
+.sch-table__session{width:104px;background:#fffbeb;text-align:center;vertical-align:middle;padding:10px 6px;}
+.sch-table__session-name{font-size:13px;font-weight:800;color:#92400e;line-height:1.2;}
+.sch-table__session-time{font-size:10px;font-weight:600;color:#b45309;margin-top:3px;white-space:nowrap;}
+.sch-table tbody td{padding:6px;background:#fff;}
+.sch-table tbody td.is-today{background:#f5f9ff;}
+.sch-table tbody td.is-selected{outline:2px solid #102b50;outline-offset:-2px;}
+.sch-nocls{font-size:10.5px;color:#b6c2d2;font-style:italic;text-align:center;padding:12px 4px;}
+.sch-card{display:block;border:1px solid #dbe4ef;border-left:3px solid #3b82f6;border-radius:6px;
+    background:#fbfdff;padding:6px 7px;margin-bottom:6px;text-decoration:none;color:inherit;
+    overflow:hidden;min-width:0;}
+.sch-card:last-child{margin-bottom:0;}
+.sch-card:hover{border-color:#93c5fd;}
+.sch-card.is-cancelled{background:#fff5f5;border-left-color:#ef4444;}
+.sch-card.is-makeup{border-left-color:#8b5cf6;}
+.sch-card.is-focus{box-shadow:0 0 0 2px #102b50;}
+.sch-card__name{font-size:11.5px;font-weight:800;color:#001634;line-height:1.3;overflow-wrap:anywhere;}
+.sch-card__line{font-size:10.5px;color:#64748b;line-height:1.4;margin-top:1px;overflow-wrap:anywhere;}
+.sch-card__time{font-size:11px;font-weight:700;color:#1e40af;margin-top:2px;}
+.sch-card.is-cancelled .sch-card__name,
+.sch-card.is-cancelled .sch-card__time{text-decoration:line-through;color:#b91c1c;}
+.sch-empty{padding:40px 20px;text-align:center;color:#94a3b8;font-size:13px;}
+.sch-print-title{display:none;}
+@media print{
+    .db-sidebar,.db-header,.sch-toolbar,.sch-print-hide{display:none!important;}
+    .db-layout,.db-main,.db-content{display:block!important;padding:0!important;max-width:none!important;margin:0!important;}
+    body{background:#fff!important;}
+    .card{border:0!important;box-shadow:none!important;margin:0!important;padding:0!important;}
+    .sch-print-title{display:block;font-size:14px;font-weight:800;color:#001634;margin:0 0 8px;}
+    .sch-table{min-width:0;font-size:9.5px;}
+    .sch-table thead th,.sch-table__session{padding:5px 4px;}
+    .sch-card{padding:4px 5px;margin-bottom:4px;}
+    .sch-table-wrap{overflow:visible;}
+    tr,.sch-card{break-inside:avoid;}
+}
+</style>
 
-<?php if ($cancelledCount > 0): ?>
-<div class="card" style="padding:14px 20px;border-left:4px solid #ef4444;background:#fff5f5;">
-    <div style="font-size:13px;color:#b91c1c;font-weight:600;">
-        🚫 Có <?= $cancelledCount ?> buổi học đã được hủy trong học kỳ này. Các buổi đã hủy vẫn hiển thị để bạn đối chiếu.
+<!-- 1. NEXT CLASS -->
+<div class="card sch-print-hide" style="padding:16px 20px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;">
+        <div style="font-size:14px;font-weight:800;color:#001634;">⏭ Buổi học kế tiếp</div>
+        <?php if ($nextSession): ?>
+        <span class="status-pill status-pill--<?= $nextSession['session_type'] === 'Makeup' ? 'enrolled' : 'active' ?>" style="font-size:10px;">
+            <?= $nextSession['session_type'] === 'Makeup' ? 'Học bù' : 'Theo lịch' ?>
+        </span>
+        <?php endif; ?>
     </div>
-</div>
-<?php endif; ?>
-
-<!-- Semester + view filters -->
-<div class="card" style="padding:14px 20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
-    <form method="GET" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-        <label style="font-size:13px;font-weight:600;color:#64748b;">Học kỳ:</label>
-        <select name="sem" onchange="this.form.submit()"
-                style="height:34px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;background:#fff;outline:none;">
-            <?php foreach ($semesters as $sem): ?>
-            <option value="<?= (int)$sem['semester_id'] ?>" <?= (int)$sem['semester_id'] === $semId ? 'selected' : '' ?>>
-                <?= h($sem['semester_name'] . ' – ' . $sem['academic_year']) ?><?= $sem['status'] === 'Active' ? ' (hiện tại)' : '' ?>
-            </option>
-            <?php endforeach; ?>
-        </select>
-        <input type="hidden" name="view" value="<?= h($view) ?>" />
-    </form>
-    <div style="display:flex;gap:6px;">
-        <?php foreach (['upcoming' => 'Sắp tới', 'past' => 'Đã qua', 'all' => 'Tất cả'] as $k => $lbl): ?>
-        <a href="?sem=<?= $semId ?>&view=<?= $k ?>"
-           class="pill <?= $view === $k ? 'pill--blue' : '' ?>"
-           style="<?= $view === $k ? '' : 'background:#f1f5f9;color:#64748b;' ?>text-decoration:none;">
-            <?= $lbl ?>
-        </a>
-        <?php endforeach; ?>
+    <?php if (!$nextSession): ?>
+    <div style="padding:14px 16px;background:#f8fafc;border-radius:8px;color:#94a3b8;font-size:13px;">
+        Không còn buổi học nào sắp tới trong học kỳ này.
     </div>
-</div>
-
-<!-- KPI cards -->
-<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;">
-    <div class="card" style="padding:18px;">
-        <div style="font-size:12px;color:#64748b;font-weight:600;">Tổng buổi trong học kỳ</div>
-        <div style="font-size:28px;font-weight:800;color:#001634;margin-top:4px;"><?= count($sessions) ?></div>
-        <div style="font-size:11px;color:#94a3b8;">buổi đã được xếp lịch</div>
-    </div>
-    <div class="card" style="padding:18px;">
-        <div style="font-size:12px;color:#64748b;font-weight:600;">Buổi sắp tới</div>
-        <div style="font-size:28px;font-weight:800;color:#1e40af;margin-top:4px;"><?= $upcomingCount ?></div>
-        <div style="font-size:11px;color:#94a3b8;">chưa diễn ra</div>
-    </div>
-    <div class="card" style="padding:18px;">
-        <div style="font-size:12px;color:#64748b;font-weight:600;">Buổi học bù</div>
-        <div style="font-size:28px;font-weight:800;color:#4338ca;margin-top:4px;"><?= $makeupCount ?></div>
-        <div style="font-size:11px;color:#94a3b8;">đã được duyệt</div>
-    </div>
-    <div class="card" style="padding:18px;">
-        <div style="font-size:12px;color:#64748b;font-weight:600;">Buổi đã hủy</div>
-        <div style="font-size:28px;font-weight:800;color:#b91c1c;margin-top:4px;"><?= $cancelledCount ?></div>
-        <div style="font-size:11px;color:#94a3b8;">theo thông báo chính thức</div>
-    </div>
-</div>
-
-<?php if ($nextSession): ?>
-<div class="card" style="padding:16px 20px;display:flex;align-items:center;gap:14px;border-left:4px solid #3b82f6;">
-    <div style="font-size:11px;font-weight:700;color:#1e40af;text-transform:uppercase;">Buổi học kế tiếp</div>
-    <div style="font-size:13px;color:#001634;font-weight:700;">
-        <?= h($nextSession['course_code']) ?> – <?= h($nextSession['course_name']) ?>
-    </div>
-    <div style="font-size:12px;color:#64748b;">
-        <?= $dayShort[date('D', strtotime($nextSession['session_date']))] ?? '' ?>,
-        <?= date('d/m/Y', strtotime($nextSession['session_date'])) ?> •
-        <?= substr($nextSession['start_time'], 0, 5) ?>–<?= substr($nextSession['end_time'], 0, 5) ?>
-        <?= $nextSession['room'] ? ' • 📍 ' . h($nextSession['room']) : '' ?>
-    </div>
-</div>
-<?php endif; ?>
-
-<!-- Weekly pattern -->
-<div class="card">
-    <div style="padding:16px 20px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;align-items:center;">
-        <div style="font-size:15px;font-weight:700;color:#001634;">🗓️ Lịch tuần chính thức</div>
-        <div style="font-size:12px;color:#64748b;"><?= count($weekly) ?> lớp trong học kỳ</div>
-    </div>
-    <?php if (empty($weekly)): ?>
-    <div style="padding:32px;text-align:center;color:#94a3b8;font-size:13px;">
-        Chưa có lịch tuần chính thức cho các lớp đã đăng ký.
-    </div>
-    <?php else: ?>
-    <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:10px;padding:16px;overflow-x:auto;">
-        <?php for ($d = 1; $d <= 7; $d++): ?>
-        <div style="background:#f8fafc;border-radius:10px;padding:10px;min-height:120px;">
-            <div style="font-size:12px;font-weight:800;color:#001634;margin-bottom:8px;<?= $d === (int)date('N') ? 'color:#1e40af;' : '' ?>">
-                <?= $dayNames[$d] ?><?= $d === (int)date('N') ? ' •' : '' ?>
+    <?php else:
+        $nDate = date('d/m/Y', strtotime($nextSession['session_date']));
+        $nDay  = $dayNames[date('N', strtotime($nextSession['session_date']))] ?? '';
+        $focusQs = '?sem=' . $semId . '&filter=class&date=' . $nextSession['session_date'] . '&session=' . (int)$nextSession['session_id'];
+    ?>
+    <a href="<?= h($focusQs) ?>#session-<?= (int)$nextSession['session_id'] ?>"
+       style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+              padding:14px 16px;border:1px solid #bfdbfe;border-left:4px solid #1e40af;border-radius:10px;
+              background:#f8fbff;text-decoration:none;color:inherit;">
+        <div style="min-width:0;">
+            <div style="font-size:14px;font-weight:800;color:#001634;">
+                <?= h($nextSession['course_code']) ?> – <?= h($nextSession['course_name']) ?>
             </div>
-            <?php if (empty($byDay[$d])): ?>
-            <div style="font-size:11px;color:#cbd5e1;">Không có lớp</div>
-            <?php else: foreach ($byDay[$d] as $w): ?>
-            <div style="background:#fff;border:1px solid #e2e8f0;border-left:3px solid #3b82f6;border-radius:8px;padding:8px;margin-bottom:6px;">
-                <div style="font-size:12px;font-weight:700;color:#001634;"><?= h($w['course_code']) ?></div>
-                <div style="font-size:10px;color:#64748b;"><?= h($w['section_code']) ?></div>
-                <div style="font-size:11px;color:#1e40af;font-weight:600;margin-top:3px;">
-                    <?= substr($w['start_time'], 0, 5) ?>–<?= substr($w['end_time'], 0, 5) ?>
-                </div>
-                <div style="font-size:10px;color:#94a3b8;">
-                    <?= $w['room'] ? '📍 ' . h($w['room']) : '' ?>
-                </div>
-                <div style="font-size:10px;color:#94a3b8;"><?= h($w['lecturer_name']) ?></div>
-                <?php $wMeta = RegistrationService::statusMeta((string)($w['section_status'] ?? 'Confirmed')); ?>
-                <span style="display:inline-block;margin-top:4px;font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px;
-                             background:<?= h($wMeta['bg']) ?>;color:<?= h($wMeta['fg']) ?>;">
-                    <?= h($wMeta['label']) ?>
-                </span>
+            <div style="font-size:12px;color:#64748b;margin-top:3px;">
+                Lớp <?= h($nextSession['section_code']) ?>
+                <?= $nextSession['room'] ? ' · 📍 ' . h($nextSession['room']) : '' ?>
+                <?= $nextSession['lecturer_name'] ? ' · 👨‍🏫 ' . h($nextSession['lecturer_name']) : '' ?>
             </div>
-            <?php endforeach; endif; ?>
         </div>
-        <?php endfor; ?>
-    </div>
-    <div style="padding:0 20px 14px;font-size:11px;color:#94a3b8;">
-        Lịch tuần phản ánh buổi học theo lịch chính thức. Buổi đã hủy hoặc học bù được ghi rõ trong danh sách bên dưới.
-    </div>
+        <div style="text-align:right;">
+            <div style="font-size:13px;font-weight:700;color:#1e40af;"><?= h($nDay) ?>, <?= $nDate ?></div>
+            <div style="font-size:12px;color:#334155;">
+                <?= substr($nextSession['start_time'], 0, 5) ?>–<?= substr($nextSession['end_time'], 0, 5) ?>
+            </div>
+        </div>
+    </a>
     <?php endif; ?>
 </div>
 
-<!-- Session list -->
-<div class="card" style="padding:0;overflow:hidden;">
-    <div style="padding:16px 20px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-        <div style="font-size:15px;font-weight:700;color:#001634;">
-            📅 Danh sách buổi học
-            <span style="font-size:12px;color:#64748b;font-weight:400;">
-                (<?= $view === 'upcoming' ? 'sắp tới' : ($view === 'past' ? 'đã qua' : 'tất cả') ?> – <?= count($visible) ?> buổi)
-            </span>
+<!-- 2. OFFICIAL WEEK -->
+<div class="card" style="margin-top:14px;padding:0;overflow:hidden;">
+    <div style="padding:14px 18px;border-bottom:1px solid #f1f5f9;">
+        <div class="sch-toolbar">
+            <div class="sch-toolbar__group">
+                <div style="font-size:14px;font-weight:800;color:#001634;margin-right:6px;">🗓 Lịch theo tuần chính thức</div>
+                <?php foreach (['class' => 'Lịch học', 'exam' => 'Lịch thi', 'all' => 'Tất cả'] as $k => $label): ?>
+                <a class="sch-tab<?= $filter === $k ? ' is-active' : '' ?>"
+                   href="<?= h($navQs(['filter' => $k, 'session' => 0])) ?>"><?= $label ?></a>
+                <?php endforeach; ?>
+            </div>
+            <div class="sch-toolbar__group">
+                <form method="GET" style="display:flex;align-items:center;gap:6px;margin:0;">
+                    <input type="hidden" name="filter" value="<?= h($filter) ?>" />
+                    <select name="sem" onchange="this.form.submit()"
+                            style="height:34px;border:1px solid #e2e8f0;border-radius:8px;padding:0 8px;font-size:12px;background:#fff;">
+                        <?php foreach ($semesters as $sem): ?>
+                        <option value="<?= (int)$sem['semester_id'] ?>" <?= (int)$sem['semester_id'] === $semId ? 'selected' : '' ?>>
+                            <?= h($sem['semester_name'] . ' – ' . $sem['academic_year']) ?><?= $sem['status'] === 'Active' ? ' (hiện tại)' : '' ?>
+                        </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <input type="date" name="date" value="<?= h($selectedDate) ?>" onchange="this.form.submit()"
+                           style="height:34px;border:1px solid #e2e8f0;border-radius:8px;padding:0 8px;font-size:12px;background:#fff;" />
+                </form>
+            </div>
         </div>
-        <div style="font-size:11px;color:#94a3b8;">Chỉ hiển thị lịch đã được Nhà trường xác nhận</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:10px;">
+            <div style="font-size:12.5px;color:#475569;font-weight:600;">
+                Tuần: <?= date('d/m', strtotime($weekStartStr)) ?> – <?= date('d/m/Y', strtotime($weekEndStr)) ?>
+                <span style="font-weight:400;color:#94a3b8;">· <?= $weekCount ?> buổi<?= $cancelledInWeek > 0 ? ' (' . $cancelledInWeek . ' đã hủy)' : '' ?></span>
+            </div>
+            <div class="sch-toolbar__group">
+                <a class="sch-btn" href="<?= h($navQs(['date' => $weekStart->modify('-7 day')->format('Y-m-d')])) ?>">‹ Tuần trước</a>
+                <a class="sch-btn" href="<?= h($navQs(['date' => date('Y-m-d')])) ?>">Tuần này</a>
+                <a class="sch-btn" href="<?= h($navQs(['date' => $weekStart->modify('+7 day')->format('Y-m-d')])) ?>">Tuần sau ›</a>
+                <button type="button" class="sch-btn" onclick="window.print()">In thời khóa biểu</button>
+            </div>
+        </div>
     </div>
-    <div class="data-table-wrap">
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>NGÀY</th>
-                    <th>GIỜ</th>
-                    <th>HỌC PHẦN</th>
-                    <th>LỚP HỌC PHẦN</th>
-                    <th>PHÒNG</th>
-                    <th>GIẢNG VIÊN</th>
-                    <th>TRẠNG THÁI</th>
-                </tr>
-            </thead>
-            <tbody>
-            <?php if (empty($visible)): ?>
-                <tr><td colspan="7" style="text-align:center;padding:32px;color:#94a3b8;font-style:italic;">
-                    Không có buổi học nào trong mục này.
-                </td></tr>
-            <?php else: foreach ($visible as $s):
-                $isCancelled = $s['status'] === 'Cancelled';
-                $isMakeup    = $s['session_type'] === 'Makeup';
-                $secStatus   = (string)($s['section_status'] ?? 'Confirmed');
-                $isPending   = !$isCancelled && ($secStatus === 'Pending' || $s['status'] === 'Pending');
-                $isInsufficient = !$isCancelled && $secStatus === 'Insufficient';
-                $secMeta     = RegistrationService::statusMeta($secStatus);
-            ?>
-                <tr style="<?= $isCancelled ? 'background:#fff5f5;' : ($isPending ? 'background:#fffbeb;' : ($s['session_date'] === $today ? 'background:#eff6ff;' : '')) ?>">
-                    <td style="white-space:nowrap;">
-                        <div style="font-weight:700;color:<?= $isCancelled ? '#b91c1c' : '#001634' ?>;<?= $isCancelled ? 'text-decoration:line-through;' : '' ?>">
-                            <?= date('d/m/Y', strtotime($s['session_date'])) ?>
-                        </div>
-                        <div style="font-size:11px;color:#94a3b8;">
-                            <?= $dayShort[date('D', strtotime($s['session_date']))] ?? '' ?><?= $s['session_date'] === $today ? ' • HÔM NAY' : '' ?>
-                        </div>
-                    </td>
-                    <td style="white-space:nowrap;font-size:12px;color:#44474e;">
-                        <?= substr($s['start_time'], 0, 5) ?>–<?= substr($s['end_time'], 0, 5) ?>
-                    </td>
-                    <td>
-                        <div style="font-weight:600;color:#001634;<?= $isCancelled ? 'text-decoration:line-through;' : '' ?>">
-                            <?= h($s['course_code']) ?> – <?= h($s['course_name']) ?>
-                        </div>
-                        <div style="font-size:11px;color:#94a3b8;"><?= (int)$s['credits'] ?> tín chỉ</div>
-                    </td>
-                    <td style="font-size:12px;color:#64748b;">
-                        <?= h($s['section_code']) ?>
-                        <?php if ($secStatus !== 'Confirmed' && !$isCancelled): ?>
-                        <div style="font-size:10px;color:<?= h($secMeta['fg']) ?>;margin-top:2px;"><?= h($secMeta['label']) ?></div>
-                        <?php endif; ?>
-                    </td>
-                    <td style="font-size:12px;color:#64748b;"><?= $s['room'] ? h($s['room']) : '—' ?></td>
-                    <td style="font-size:12px;color:#64748b;"><?= h($s['lecturer_name'] ?? '—') ?></td>
-                    <td>
-                        <?php if ($isCancelled): ?>
-                        <span class="status-pill status-pill--absent">Đã hủy</span>
-                        <?php elseif ($isInsufficient): ?>
-                        <span class="status-pill status-pill--absent">Không đủ sĩ số</span>
-                        <?php elseif ($isPending): ?>
-                        <span class="status-pill status-pill--late">Chờ mở lớp</span>
-                        <?php elseif ($isMakeup): ?>
-                        <span class="status-pill status-pill--enrolled">Học bù</span>
-                        <?php elseif ($s['session_date'] === $today): ?>
-                        <span class="status-pill status-pill--late">Hôm nay</span>
-                        <?php else: ?>
-                        <span class="status-pill status-pill--active">Theo lịch</span>
-                        <?php endif; ?>
-                    </td>
-                </tr>
-            <?php endforeach; endif; ?>
-            </tbody>
-        </table>
-    </div>
-</div>
 
-<?php if ($view !== 'past' && $cancelledCount > 0): ?>
-<div class="card" style="padding:14px 20px;">
-    <div style="font-size:12px;color:#64748b;">
-        ℹ️ Buổi học bị hủy không được tính vào điểm danh. Nếu Nhà trường duyệt buổi học bù, buổi mới sẽ xuất hiện trong danh sách với nhãn <strong>Học bù</strong>.
+    <?php if ($filter === 'exam'): ?>
+    <div class="sch-empty">
+        <div style="font-size:26px;margin-bottom:6px;">🗒️</div>
+        Chưa có lịch thi chính thức cho học kỳ này.<br/>
+        Lịch thi sẽ hiển thị tại đây ngay khi Nhà trường công bố.
     </div>
+    <?php else: ?>
+    <div class="sch-print-title">
+        Thời khóa biểu tuần <?= date('d/m/Y', strtotime($weekStartStr)) ?> – <?= date('d/m/Y', strtotime($weekEndStr)) ?>
+    </div>
+    <div class="sch-table-wrap">
+    <table class="sch-table">
+        <thead>
+            <tr>
+                <th class="sch-table__ca">Ca học</th>
+                <?php foreach ($weekDates as $d): $dow = date('N', strtotime($d)); ?>
+                <th>
+                    <?= h($dayNames[$dow] ?? '') ?>
+                    <span class="sch-table__date"><?= date('d/m', strtotime($d)) ?></span>
+                </th>
+                <?php endforeach; ?>
+            </tr>
+        </thead>
+        <tbody>
+            <?php foreach (['morning' => ['Sáng', '07:00–12:30'], 'afternoon' => ['Chiều', '13:00–18:30']] as $sessKey => [$sessName, $sessTime]): ?>
+            <tr>
+                <th class="sch-table__session">
+                    <div class="sch-table__session-name"><?= h($sessName) ?></div>
+                    <div class="sch-table__session-time"><?= h($sessTime) ?></div>
+                </th>
+                <?php foreach ($weekDates as $d):
+                    $isToday = $d === $today;
+                    $isSel = $d === $selectedDate;
+                    $rows = $daySchedule[$d][$sessKey];
+                ?>
+                <td class="<?= $isToday ? 'is-today' : '' ?><?= $isSel && !$isToday ? ' is-selected' : '' ?>">
+                    <?php if (empty($rows)): ?>
+                    <div class="sch-nocls">Không có lớp</div>
+                    <?php else: foreach ($rows as $s): ?>
+                    <?= $renderCard($s, $d) ?>
+                    <?php endforeach; endif; ?>
+                </td>
+                <?php endforeach; ?>
+            </tr>
+            <?php endforeach; ?>
+        </tbody>
+    </table>
+    </div>
+    <?php if ($filter === 'all'): ?>
+    <div style="padding:0 18px 14px;font-size:11.5px;color:#94a3b8;">
+        Hệ thống chưa có dữ liệu lịch thi chính thức nên chỉ hiển thị các buổi học.
+    </div>
+    <?php endif; ?>
+    <?php endif; ?>
 </div>
-<?php endif; ?>
 
 </div></main>
 <script src="../../assets/js/dashboard.js"></script>

@@ -5,6 +5,7 @@
  */
 $root = dirname(__DIR__, 3);
 require_once $root . '/src/src/helpers/auth.php';
+require_once $root . '/src/src/services/AttendanceService.php';
 
 require_login();
 if ($_SESSION['role'] === 'Student')  { header('Location: /UniPortal/public/assets/student/dashboard.php'); exit; }
@@ -13,70 +14,47 @@ if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public
 
 $pdo = get_db();
 
-// Stats
-$totalSV      = (int)$pdo->query("SELECT COUNT(*) FROM Student WHERE status='Active'")->fetchColumn();
-$currentSemRow= $pdo->query("SELECT semester_id,semester_name,academic_year FROM Semester WHERE status='Active' ORDER BY start_date DESC LIMIT 1")->fetch();
-$semId        = (int)($currentSemRow['semester_id'] ?? 0);
+// Official-session based monitoring (shared calculation with student/lecturer).
+$policy      = AttendanceService::policy();
+$currentSemRow = $pdo->query("SELECT semester_id,semester_name,academic_year FROM Semester WHERE status='Active' ORDER BY start_date DESC LIMIT 1")->fetch();
+$semId       = (int)($currentSemRow['semester_id'] ?? 0);
+$overview    = $semId ? AttendanceService::semesterOverview($pdo, $semId) : ['sections'=>[], 'students'=>[], 'stats'=>['sections'=>0,'official'=>0,'completed'=>0,'students'=>0,'at_risk'=>0,'at_threshold'=>0,'ineligible'=>0,'absent_total'=>0]];
+$overviewStats = $overview['stats'];
+$allStudents   = $overview['students'];
 
-// Overall attendance rate
-$attQuery = $pdo->query(
-    "SELECT ROUND(100*SUM(a.status IN ('Present','Late','Excused'))/NULLIF(COUNT(*),0),1) AS rate,
-            SUM(a.status='Absent') AS absent_cnt, COUNT(*) AS total_cnt
-     FROM Attendance a"
-);
-$attStat = $attQuery->fetch();
-$attRate     = (float)($attStat['rate'] ?? 93.6);
-$absentCnt   = (int)($attStat['absent_cnt'] ?? 0);
+$totalSV      = (int)$overviewStats['students'];
+$absentCnt    = (int)$overviewStats['absent_total'];
+$ineligibleCnt= (int)$overviewStats['ineligible'];
+$atRiskCnt    = (int)$overviewStats['at_risk'] + (int)($overviewStats['at_threshold'] ?? 0);
 
-// Students with low attendance
-$lowAtt = $pdo->prepare(
-    "SELECT s.student_id, s.full_name, s.class_code,
-            cs.section_code,
-            COUNT(a.attendance_id) AS total_sessions,
-            SUM(a.status='Absent') AS absent_count,
-            ROUND(100*SUM(a.status='Absent')/NULLIF(COUNT(a.attendance_id),0),1) AS absent_pct
-     FROM Enrollment e
-     JOIN Student s ON s.student_id=e.student_id
-     JOIN ClassSection cs ON cs.section_id=e.section_id
-     LEFT JOIN Attendance a ON a.enrollment_id=e.enrollment_id
-     WHERE cs.semester_id=:sem OR :sem2=0
-     GROUP BY s.student_id, cs.section_code
-     HAVING absent_pct > 15
-     ORDER BY absent_pct DESC
-     LIMIT 20"
-);
-$lowAtt->execute([':sem'=>$semId, ':sem2'=>$semId]);
-$lowAttRows = $lowAtt->fetchAll();
+// Overall attendance rate = attended records / available completed sessions
+$attendedSum = 0; $completedSum = 0;
+foreach ($allStudents as $st) {
+    $attendedSum  += (int)$st['present'] + (int)$st['late'] + (int)$st['excused'];
+    $completedSum += (int)$st['completed_total'];
+}
+$attRate = $completedSum > 0 ? round($attendedSum / $completedSum * 100, 1) : null;
 
-// Dept-level section counts
-$sections = $pdo->prepare(
-    "SELECT section_code, course_code, course_name, enrolled, att_rate
-     FROM (
-         SELECT cs.section_code, c.course_code, c.course_name,
-                COUNT(DISTINCT e.student_id) AS enrolled,
-                ROUND(100*SUM(a.status IN ('Present','Late','Excused'))/NULLIF(COUNT(a.attendance_id),0),1) AS att_rate
-         FROM ClassSection cs
-         JOIN Course c ON c.course_id=cs.course_id
-         LEFT JOIN Enrollment e ON e.section_id=cs.section_id
-         LEFT JOIN Attendance a ON a.enrollment_id=e.enrollment_id
-         WHERE cs.semester_id=:sem OR :sem2=0
-         GROUP BY cs.section_id, cs.section_code, c.course_code, c.course_name
-     ) AS sub
-     ORDER BY ISNULL(att_rate) ASC, att_rate ASC
-     LIMIT 10"
-);
-$sections->execute([':sem'=>$semId, ':sem2'=>$semId]);
-$sectionRows = $sections->fetchAll();
+// Students at/above the warning threshold (exceeding / approaching)
+$flaggedRows = AttendanceService::flaggedStudents($allStudents);
+$lowAttRows  = array_slice($flaggedRows, 0, 20);
+
+// Section-level distribution (real official-session data)
+$sectionRows = [];
+foreach ($overview['sections'] as $sr) {
+    $den = (int)$sr['completed'] * max(1, (int)$sr['enrolled']);
+    $sr['att_rate'] = $den > 0 ? round((int)$sr['attended_total'] / $den * 100, 1) : null;
+    $sectionRows[] = $sr;
+}
+usort($sectionRows, fn($a, $b) => ($a['att_rate'] ?? 101) <=> ($b['att_rate'] ?? 101));
+$sectionRows = array_slice($sectionRows, 0, 10);
 
 // Bar chart data per section
 $barLabels = []; $barData = [];
 foreach ($sectionRows as $sr) {
+    if ($sr['att_rate'] === null) continue;
     $barLabels[] = $sr['section_code'];
-    $barData[]   = $sr['att_rate'] ?? 0;
-}
-if (empty($barLabels)) {
-    $barLabels = ['MIS202','STA101','MKT201','MIS201','MOT101','FIN300','EN2104'];
-    $barData   = [96.6, 94.5, 92.2, 100, 88.0, 92.0, 90.5];
+    $barData[]   = $sr['att_rate'];
 }
 
 // Urgent requests (attendance certificates)
@@ -102,32 +80,32 @@ require __DIR__ . '/_layout.php';
             <span class="adm-kpi__icon adm-kpi__icon--blue"><img src="../img/db-nav-profile.svg" alt="" /></span>
         </div>
         <div class="adm-kpi__value"><span class="adm-kpi__num"><?= number_format($totalSV) ?></span></div>
-        <div class="adm-kpi__sub">Toàn bộ lớp học phần HK1 (2026-2027)</div>
-        <div class="adm-kpi__sub">⊕ Dữ liệu điều chỉnh</div>
+        <div class="adm-kpi__sub"><?= htmlspecialchars(($currentSemRow['semester_name'] ?? 'Học kỳ hiện tại').' '.($currentSemRow['academic_year'] ?? '')) ?></div>
+        <div class="adm-kpi__sub"><?= (int)$overviewStats['sections'] ?> lớp • <?= (int)$overviewStats['official'] ?> buổi chính thức</div>
     </div>
     <div class="acard adm-kpi">
         <div class="adm-kpi__header">
             <span class="adm-kpi__label">Tỷ lệ chuyên cần trung bình</span>
             <span class="adm-kpi__icon adm-kpi__icon--green"><img src="../img/db-icon-attendance.svg" alt="" /></span>
         </div>
-        <div class="adm-kpi__value"><span class="adm-kpi__num"><?= number_format($attRate,1) ?>%</span></div>
-        <div class="adm-kpi__sub adm-kpi__sub--down">↓ -0.4 &nbsp;<span style="color:#94a3b8;">Đạt yêu cầu học vụ của Nhà trường</span></div>
+        <div class="adm-kpi__value"><span class="adm-kpi__num"><?= $attRate !== null ? number_format($attRate,1).'%' : '—' ?></span></div>
+        <div class="adm-kpi__sub"><?= (int)$overviewStats['completed'] ?> lượt buổi đã dạy • <?= $absentCnt ?> lượt vắng</div>
     </div>
     <div class="acard adm-kpi">
         <div class="adm-kpi__header">
-            <span class="adm-kpi__label">Chuyên cần thấp (-80%)</span>
+            <span class="adm-kpi__label">Cận ngưỡng cấm thi (≥<?= rtrim(rtrim(number_format($policy['warn_from'],1,'.',''),'0'),'.') ?>%)</span>
             <span class="adm-kpi__icon adm-kpi__icon--yellow"><img src="../img/db-icon-alert-warn.svg" alt="" /></span>
         </div>
-        <div class="adm-kpi__value"><span class="adm-kpi__num"><?= count($lowAttRows) ?></span><span class="adm-kpi__unit">sinh viên</span></div>
-        <div class="adm-kpi__sub">Chấm 1.95% &nbsp;<span class="apill apill--orange" style="font-size:10px;">Mức 1</span></div>
+        <div class="adm-kpi__value"><span class="adm-kpi__num"><?= $atRiskCnt ?></span><span class="adm-kpi__unit">trường hợp</span></div>
+        <div class="adm-kpi__sub">Vắng đúng <?= rtrim(rtrim(number_format($policy['ban_pct'],1,'.',''),'0'),'.') ?>% vẫn đủ điều kiện dự thi</div>
     </div>
     <div class="acard adm-kpi" style="border-left:4px solid #ef4444;">
         <div class="adm-kpi__header">
-            <span class="adm-kpi__label">Nguy cơ cấm thi (&gt;20%)</span>
+            <span class="adm-kpi__label">Vượt ngưỡng cấm thi (&gt;<?= rtrim(rtrim(number_format($policy['ban_pct'],1,'.',''),'0'),'.') ?>%)</span>
             <span class="adm-kpi__icon adm-kpi__icon--red"><img src="../img/db-icon-alert-warn.svg" alt="" /></span>
         </div>
-        <div class="adm-kpi__value"><span class="adm-kpi__num adm-kpi__num--red"><?= count(array_filter($lowAttRows, fn($r)=>(float)$r['absent_pct']>20)) ?></span><span class="adm-kpi__unit">trường hợp</span></div>
-        <div class="adm-kpi__sub" style="color:#ef4444;">⚡ Đã kích hoạt cảnh báo tới !</div>
+        <div class="adm-kpi__value"><span class="adm-kpi__num adm-kpi__num--red"><?= $ineligibleCnt ?></span><span class="adm-kpi__unit">trường hợp</span></div>
+        <div class="adm-kpi__sub" style="color:#ef4444;">Không đủ điều kiện dự thi • cảnh báo tự động đã ghi nhận</div>
     </div>
 </div>
 
@@ -135,8 +113,11 @@ require __DIR__ . '/_layout.php';
 <div style="display:grid;grid-template-columns:1fr 280px;gap:16px;align-items:start;">
 
     <div class="acard" style="padding:20px 24px;">
-        <div class="adm-section-title" style="margin-bottom:4px;">Phân bố tỷ lệ chuyên cần theo Bộ môn &amp; Học phần</div>
-        <div class="adm-section-sub" style="margin-bottom:16px;">Khảo sát trên <?= count($sectionRows) ?: 104 ?> lớp học phần đang hoạt động</div>
+        <div class="adm-section-title" style="margin-bottom:4px;">Phân bố tỷ lệ chuyên cần theo lớp học phần</div>
+        <div class="adm-section-sub" style="margin-bottom:16px;">
+            Dựa trên <?= (int)$overviewStats['official'] ?> buổi chính thức của <?= (int)$overviewStats['sections'] ?> lớp
+            • Tỷ lệ vắng tính trên tổng buổi chính thức, không tính buổi hủy/tương lai/chưa điểm danh
+        </div>
         <div style="position:relative;height:200px;">
             <canvas id="attBarChart"></canvas>
         </div>
@@ -213,82 +194,55 @@ require __DIR__ . '/_layout.php';
                     <th>MSSV</th>
                     <th>HỌ VÀ TÊN</th>
                     <th>LỚP HỌC PHẦN</th>
-                    <th style="text-align:center;">TỔNG BUỔI</th>
-                    <th style="text-align:center;">CÓ MẶT</th>
-                    <th style="text-align:center;">SỐ VẮNG</th>
-                    <th>TỶ LỆ CHUYÊN CẦN</th>
-                    <th>CẬP NHẬT GẦN NHẤT</th>
-                    <th>TRẠNG THÁI</th>
+                    <th style="text-align:center;">TỔNG CHÍNH THỨC</th>
+                    <th style="text-align:center;">HOÀN THÀNH</th>
+                    <th style="text-align:center;">VẮNG (TÍNH)</th>
+                    <th>TỶ LỆ VẮNG</th>
+                    <th style="text-align:center;">CÒN ĐƯỢC VẮNG</th>
+                    <th>ĐIỀU KIỆN DỰ THI</th>
                     <th>THAO TÁC</th>
                 </tr>
             </thead>
             <tbody>
                 <?php if (empty($lowAttRows)): ?>
-                <!-- Fallback demo rows matching screenshot design -->
-                <?php
-                $demoRows = [
-                    ['21070452','Nguyễn Ngọc Anh','Cơ sở dữ liệu (MIS202-01)',12,10,2,83.3,'18/11 09:30','Theo dõi','warn'],
-                    ['21070119','Trần Hoàng Nam','Cơ sở dữ liệu (MIS202-01)',12,8,4,66.7,'18/11 09:30','Vắng >20%','crit'],
-                    ['21070452','Nguyễn Hoài An','Thống kê ứng dụng (STA101-02)',12,12,0,100,'17/11','Bình thường','ok'],
-                    ['22070831','Nguyễn Hoài An','Phân tích & TKHT (MIS201-03)',10,9,1,90.0,'18/11','Bình thường','ok'],
-                    ['23070415','Dương Thu Phượng','Marketing (MKT201-01)',12,12,0,100,'16/11','Bình thường','ok'],
-                    ['21070332','Nguyễn Thị Mận','Quản trị học (MGT101-02)',12,9,3,75.0,'15/11','Nguy cơ cao','crit'],
-                ];
-                foreach ($demoRows as $dr):
-                    $riskCls = match($dr[9]) { 'crit'=>'apill--red','warn'=>'apill--orange', default=>'apill--green' };
+                <tr><td colspan="10" style="text-align:center;padding:36px;color:#94a3b8;font-style:italic;">
+                    Không có sinh viên nào chạm ngưỡng cảnh báo chuyên cần trong học kỳ này.
+                </td></tr>
+                <?php else: ?>
+                <?php foreach ($lowAttRows as $r):
+                    $absPct   = (float)$r['absent_pct'];
+                    $official = (int)$r['official_total'];
+                    $counted  = (int)$r['absent_counted'];
+                    $isIneligible = $r['status'] === 'ineligible';
+                    $riskLbl  = $isIneligible ? 'Không đủ ĐK dự thi'
+                              : ((int)$r['risk_level'] === 2 ? 'Chạm ngưỡng cấm thi' : 'Nguy cơ mất ĐK');
+                    $riskCls  = $isIneligible || (int)$r['risk_level'] === 2 ? 'apill--red' : 'apill--orange';
                 ?>
-                <tr>
-                    <td style="font-family:monospace;font-size:12px;color:#3b82f6;"><?= $dr[0] ?></td>
-                    <td style="font-weight:600;color:#0d1b2e;"><?= $dr[1] ?></td>
-                    <td style="font-size:12px;color:#64748b;"><?= $dr[2] ?></td>
-                    <td style="text-align:center;"><?= $dr[3] ?></td>
-                    <td style="text-align:center;font-weight:700;color:#166534;"><?= $dr[4] ?></td>
-                    <td style="text-align:center;font-weight:700;color:<?= $dr[5]>2?'#ef4444':'#f59e0b' ?>;"><?= $dr[5] ?></td>
+                <tr<?= $isIneligible ? ' style="background:#fff5f5;"' : '' ?>>
+                    <td style="font-family:monospace;font-size:12px;color:#3b82f6;"><?= htmlspecialchars($r['student_id']) ?></td>
+                    <td style="font-weight:600;color:#0d1b2e;"><?= htmlspecialchars($r['full_name']) ?></td>
+                    <td style="font-size:12px;color:#64748b;"><?= htmlspecialchars($r['section_code']) ?><br/><span style="font-size:11px;color:#94a3b8;"><?= htmlspecialchars($r['course_name']) ?></span></td>
+                    <td style="text-align:center;"><?= $official ?></td>
+                    <td style="text-align:center;"><?= (int)$r['completed_total'] ?></td>
+                    <td style="text-align:center;font-weight:700;color:#ef4444;"><?= $counted ?></td>
                     <td>
                         <div style="display:flex;align-items:center;gap:6px;">
                             <div style="flex:1;height:5px;background:#e2e8f0;border-radius:9999px;overflow:hidden;min-width:60px;">
-                                <div style="height:100%;width:<?= $dr[6] ?>%;background:<?= $dr[9]==='ok'?'#22c55e':($dr[9]==='warn'?'#f59e0b':'#ef4444') ?>;border-radius:9999px;"></div>
+                                <div style="height:100%;width:<?= min(100,$absPct) ?>%;background:<?= $isIneligible?'#ef4444':'#f59e0b' ?>;border-radius:9999px;"></div>
                             </div>
-                            <span style="font-size:12px;font-weight:700;"><?= $dr[6] ?>%</span>
+                            <span style="font-size:12px;font-weight:700;"><?= number_format($absPct,1) ?>%</span>
                         </div>
                     </td>
-                    <td style="font-size:11px;color:#94a3b8;"><?= $dr[7] ?></td>
-                    <td><span class="apill <?= $riskCls ?>"><?= $dr[8] ?></span></td>
+                    <td style="text-align:center;font-weight:700;"><?= (int)$r['remaining_allowed'] ?></td>
+                    <td><span class="apill <?= $riskCls ?>" title="<?= htmlspecialchars($r['explanation']) ?>"><?= $riskLbl ?></span></td>
                     <td>
                         <div style="display:flex;gap:4px;">
-                            <a href="#" class="abtn abtn--outline abtn--sm" style="font-size:11px;">Điều chỉnh</a>
-                            <?php if ($dr[9]==='crit'): ?>
+                            <a href="courses.php" class="abtn abtn--outline abtn--sm" style="font-size:11px;">Xem lớp</a>
+                            <?php if ($isIneligible): ?>
                             <a href="auditlog.php" class="abtn abtn--red abtn--sm" style="font-size:11px;">Gửi cảnh báo</a>
                             <?php endif; ?>
                         </div>
                     </td>
-                </tr>
-                <?php endforeach; ?>
-                <?php else: ?>
-                <?php foreach ($lowAttRows as $r):
-                    $absPct = (float)$r['absent_pct'];
-                    $pres   = (int)$r['total_sessions'] - (int)$r['absent_count'];
-                    $attPct = $r['total_sessions'] > 0 ? round($pres/$r['total_sessions']*100,1) : 0;
-                    $risk   = $absPct > 20 ? ['Nguy cơ cấm thi','apill--red'] : ['Cần theo dõi','apill--orange'];
-                ?>
-                <tr>
-                    <td style="font-family:monospace;font-size:12px;color:#3b82f6;"><?= htmlspecialchars($r['student_id']) ?></td>
-                    <td style="font-weight:600;color:#0d1b2e;"><?= htmlspecialchars($r['full_name']) ?></td>
-                    <td style="font-size:12px;color:#64748b;"><?= htmlspecialchars($r['section_code']) ?></td>
-                    <td style="text-align:center;"><?= (int)$r['total_sessions'] ?></td>
-                    <td style="text-align:center;font-weight:700;color:#166534;"><?= $pres ?></td>
-                    <td style="text-align:center;font-weight:700;color:#ef4444;"><?= (int)$r['absent_count'] ?></td>
-                    <td>
-                        <div style="display:flex;align-items:center;gap:6px;">
-                            <div style="flex:1;height:5px;background:#e2e8f0;border-radius:9999px;overflow:hidden;min-width:60px;">
-                                <div style="height:100%;width:<?= $attPct ?>%;background:<?= $absPct>20?'#ef4444':'#f59e0b' ?>;border-radius:9999px;"></div>
-                            </div>
-                            <span style="font-size:12px;font-weight:700;"><?= $attPct ?>%</span>
-                        </div>
-                    </td>
-                    <td style="font-size:11px;color:#94a3b8;">—</td>
-                    <td><span class="apill <?= $risk[1] ?>"><?= $risk[0] ?></span></td>
-                    <td><a href="#" class="abtn abtn--red abtn--sm" style="font-size:11px;">Gửi cảnh báo</a></td>
                 </tr>
                 <?php endforeach; ?>
                 <?php endif; ?>
@@ -296,8 +250,8 @@ require __DIR__ . '/_layout.php';
         </table>
     </div>
     <div style="padding:10px 16px;font-size:12px;color:#64748b;border-top:1px solid #f1f5f9;display:flex;justify-content:space-between;">
-        <span>Hiển thị 1 – 6 trong tổng số <?= number_format($totalSV) ?> bản ghi</span>
-        <div class="adm-pagination"><span class="active">1</span><a href="#">2</a><a href="#">3</a></div>
+        <span>Hiển thị <?= count($lowAttRows) ?> trường hợp cần theo dõi trên tổng số <?= number_format($totalSV) ?> lượt đăng ký học phần</span>
+        <div class="adm-pagination"><span class="active">1</span></div>
     </div>
 </div>
 

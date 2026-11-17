@@ -39,6 +39,16 @@ function doSaveStudent(PDO $pdo, array $p, bool $isNew): string {
     if ($year < 2000 || $year > (int)date('Y') + 1)
         return 'error:Năm nhập học không hợp lệ.';
 
+    if ($dob !== null) {
+        $d = DateTime::createFromFormat('Y-m-d', $dob);
+        if (!$d || $d->format('Y-m-d') !== $dob) {
+            return 'error:Ngày sinh không hợp lệ.';
+        }
+        if ($dob > date('Y-m-d')) {
+            return 'error:Date of birth cannot be in the future.';
+        }
+    }
+
     if ($isNew) {
         // Check duplicate student_id
         $ck = $pdo->prepare('SELECT 1 FROM Student WHERE student_id = :sid LIMIT 1');
@@ -167,20 +177,26 @@ $totalSV    = (int)$pdo->query("SELECT COUNT(*) FROM Student WHERE status='Activ
 $totalAcc   = (int)$pdo->query("SELECT COUNT(*) FROM Account WHERE is_active=TRUE")->fetchColumn();
 $activeWarn = (int)$pdo->query("SELECT COUNT(DISTINCT student_id) FROM AcademicWarning WHERE status='Active'")->fetchColumn();
 $pendingAcc = (int)$pdo->query("SELECT COUNT(*) FROM Account WHERE is_active=FALSE")->fetchColumn();
+$demoTotal  = (int)$pdo->query("SELECT COUNT(*) FROM Student WHERE is_demo=1")->fetchColumn();
 
 // ── Filters ──────────────────────────────────────────────────
 $search  = trim($_GET['q']      ?? '');
 $deptF   = trim($_GET['dept']   ?? '');
 $statusF = trim($_GET['status'] ?? '');
+$demoF   = trim($_GET['demo']   ?? '');
 $page    = max(1, (int)($_GET['page'] ?? 1));
-$perPage = 10;
+$perPage = 25;
 $offset  = ($page - 1) * $perPage;
 
 $where  = "WHERE 1=1";
 $params = [];
 if ($search !== '') {
-    $where .= " AND (s.student_id LIKE :q OR s.full_name LIKE :q OR s.email LIKE :q OR s.class_code LIKE :q)";
-    $params[':q'] = '%' . $search . '%';
+    $like = '%' . $search . '%';
+    $where .= " AND (s.student_id LIKE :q1 OR s.full_name LIKE :q2 OR s.email LIKE :q3 OR s.class_code LIKE :q4)";
+    $params[':q1'] = $like;
+    $params[':q2'] = $like;
+    $params[':q3'] = $like;
+    $params[':q4'] = $like;
 }
 if ($deptF !== '') {
     $where .= " AND d.department_code = :dept";
@@ -190,6 +206,10 @@ if ($statusF !== '') {
     $where .= " AND s.status = :st";
     $params[':st'] = $statusF;
 }
+if ($demoF === 'demo' || $demoF === 'real') {
+    $where .= " AND s.is_demo = :demo";
+    $params[':demo'] = $demoF === 'demo' ? 1 : 0;
+}
 
 $countSt = $pdo->prepare("SELECT COUNT(*) FROM Student s LEFT JOIN Department d ON d.department_id=s.department_id $where");
 $countSt->execute($params);
@@ -198,7 +218,7 @@ $totalPages    = max(1, (int)ceil($totalFiltered / $perPage));
 
 $listSt = $pdo->prepare(
     "SELECT s.student_id, s.full_name, s.class_code, s.email, s.phone,
-            s.gender, s.date_of_birth, s.admission_year, s.status,
+            s.gender, s.date_of_birth, s.admission_year, s.status, s.is_demo,
             d.department_name, d.department_code, d.department_id,
             a.is_active AS acc_active, a.account_id,
             (SELECT COUNT(*) FROM AcademicWarning aw WHERE aw.student_id=s.student_id AND aw.status='Active') AS warn_cnt,
@@ -355,8 +375,13 @@ require __DIR__ . '/_layout.php';
             <option value="Suspended" <?= $statusF==='Suspended'?'selected':'' ?>>Cảnh báo</option>
             <option value="Withdrawn" <?= $statusF==='Withdrawn'?'selected':'' ?>>Thôi học</option>
         </select>
+        <select name="demo" style="height:36px;padding:0 10px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;">
+            <option value="">Mọi nguồn dữ liệu</option>
+            <option value="real" <?= $demoF==='real'?'selected':'' ?>>Hồ sơ chính thức</option>
+            <option value="demo" <?= $demoF==='demo'?'selected':'' ?>>Dữ liệu demo (<?= number_format($demoTotal) ?>)</option>
+        </select>
         <button type="submit" class="abtn abtn--primary abtn--sm">🔍 Lọc</button>
-        <?php if ($search || $deptF || $statusF): ?>
+        <?php if ($search || $deptF || $statusF || $demoF): ?>
         <a href="students.php" class="abtn abtn--outline abtn--sm">✕ Xóa lọc</a>
         <?php endif; ?>
     </form>
@@ -365,7 +390,7 @@ require __DIR__ . '/_layout.php';
 <!-- ── Student table ──────────────────────────────────────── -->
 <div class="acard" style="padding:0;overflow:hidden;border-radius:12px;">
     <div style="padding:12px 20px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#64748b;">
-        Hiển thị <?= $offset+1 ?>–<?= min($offset+$perPage,$totalFiltered) ?> trong tổng số <strong><?= number_format($totalFiltered) ?></strong> sinh viên
+        Hiển thị <?= $totalFiltered ? ($offset+1) . '–' . min($offset+$perPage,$totalFiltered) : '0' ?> trong tổng số <strong><?= number_format($totalFiltered) ?></strong> sinh viên
     </div>
     <div class="adm-table-wrap">
         <table class="adm-table">
@@ -403,6 +428,9 @@ require __DIR__ . '/_layout.php';
                             <div>
                                 <div style="font-weight:700;color:#0d1b2e;font-size:13px;">
                                     <?= h($sv['full_name']) ?>
+                                    <?php if ($sv['is_demo']): ?>
+                                    <span class="apill apill--gray" style="font-size:9px;margin-left:4px;" title="Hồ sơ được tạo tự động cho mục đích demo">DEMO</span>
+                                    <?php endif; ?>
                                     <?php if ($wc > 0): ?>
                                     <span class="apill apill--red" style="font-size:9px;margin-left:4px;">△ <?= $wc ?></span>
                                     <?php endif; ?>
@@ -603,6 +631,7 @@ function modalStudentFields(array $depts, string $prefix = ''): string {
         <div>
             <label style="font-size:12px;font-weight:600;color:#334155;display:block;margin-bottom:4px;">Ngày sinh</label>
             <input type="date" name="date_of_birth" id="<?= $prefix ?>date_of_birth"
+                   max="<?= date('Y-m-d') ?>"
                    style="width:100%;height:36px;border:1px solid #e2e8f0;border-radius:8px;padding:0 10px;font-size:13px;outline:none;" />
         </div>
         <div>
@@ -742,4 +771,18 @@ function setVal(id, val) {
 document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') ['modalAdd','modalEdit','modalView'].forEach(closeModal);
 });
+// Date of birth must not be in the future (mirrors server-side validation)
+(function () {
+    var now = new Date();
+    var today = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+    document.querySelectorAll('input[name="date_of_birth"]').forEach(function (inp) {
+        function check() {
+            inp.setCustomValidity(inp.value && inp.value > today
+                ? 'Date of birth cannot be in the future.' : '');
+        }
+        inp.addEventListener('input', check);
+        inp.addEventListener('change', check);
+        check();
+    });
+})();
 </script>

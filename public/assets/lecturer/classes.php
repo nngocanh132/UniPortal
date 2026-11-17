@@ -6,6 +6,7 @@
 $root = dirname(__DIR__, 3);
 require_once $root . '/src/src/helpers/auth.php';
 require_once $root . '/src/src/models/Lecturer.php';
+require_once $root . '/src/src/services/AttendanceService.php';
 
 require_lecturer();
 if (isset($_GET['logout'])) { auth_logout(); header('Location: /UniPortal/public/index.php'); exit; }
@@ -30,13 +31,18 @@ foreach ($sections as $s) {
 // Students in selected section
 $statusF  = trim($_GET['status'] ?? '');
 $students = $selSection ? LecturerModel::getStudentsInSection($selSection, $search) : [];
+$sectionAtt = $selSection ? AttendanceService::sectionSummary(get_db(), $selSection) : [];
+$attByEnrollment = [];
+foreach (($sectionAtt['students'] ?? []) as $st) {
+    $attByEnrollment[(int)$st['enrollment_id']] = $st;
+}
 if ($statusF !== '') {
-    $students = array_values(array_filter($students, function ($st) use ($statusF) {
-        $tot = max(1, (int)$st['total_sessions']);
-        $pct = (int)$st['attended'] / $tot * 100;
-        if ($statusF === 'ok')   return $pct >= 90;
-        if ($statusF === 'warn') return $pct >= 80 && $pct < 90;
-        if ($statusF === 'crit') return $pct < 80;
+    $students = array_values(array_filter($students, function ($st) use ($statusF, $attByEnrollment) {
+        $stat = $attByEnrollment[(int)$st['enrollment_id']] ?? null;
+        if (!$stat) return true;
+        if ($statusF === 'ok')   return $stat['status'] === 'eligible' && (int)$stat['risk_level'] !== 2;
+        if ($statusF === 'warn') return $stat['status'] === 'at_risk' || (int)$stat['risk_level'] === 2;
+        if ($statusF === 'crit') return $stat['status'] === 'ineligible';
         return true;
     }));
 }
@@ -72,19 +78,9 @@ if (isset($_GET['student'])) {
     header('Content-Type: application/json');
     if (!$detail) { echo json_encode([]); exit; }
 
-    $att = $pdo->prepare(
-        "SELECT
-            COUNT(*) AS total,
-            SUM(a.status='Present') AS present,
-            SUM(a.status='Late')    AS late,
-            SUM(a.status='Absent')  AS absent,
-            SUM(a.status='Excused') AS excused
-         FROM Attendance a
-         JOIN AttendanceSession ats ON ats.session_id = a.session_id
-         WHERE a.enrollment_id = :eid AND ats.section_id = :sec"
+    $detail['attendance'] = AttendanceService::studentSectionStats(
+        $pdo, (int)$detail['enrollment_id'], (int)$detail['section_id']
     );
-    $att->execute([':eid' => $detail['enrollment_id'], ':sec' => $detail['section_id']]);
-    $detail['attendance'] = $att->fetch() ?: [];
 
     $asm = $pdo->prepare(
         "SELECT a.assignment_id, a.title, a.due_date, a.max_score, a.status,
@@ -141,7 +137,8 @@ function initials(string $n): string {
                  WHERE a.section_id=:sid1 AND a.is_deleted=0 AND a.status<>'Draft') AS asg_total,
                 (SELECT COUNT(*) FROM Submission sub
                  JOIN Assignment a2 ON a2.assignment_id=sub.assignment_id
-                 WHERE a2.section_id=:sid2 AND a2.is_deleted=0 AND a2.status<>'Draft') AS sub_total"
+                 WHERE a2.section_id=:sid2 AND a2.is_deleted=0 AND a2.status<>'Draft'
+                   AND sub.submitted_at IS NOT NULL) AS sub_total"
         );
         $subStmt->execute([':sid1' => $sec['section_id'], ':sid2' => $sec['section_id']]);
         $subRow = $subStmt->fetch();
@@ -149,15 +146,12 @@ function initials(string $n): string {
         $subTotal = (int)($subRow['sub_total'] ?? 0);
         $expected = $asgTotal * max(1, (int)$sec['enrolled_count']);
         $submitPct = $expected > 0 ? min(100, round($subTotal / $expected * 100)) : 0;
-        // attendance rate
-        $attStmt = $pdo2->prepare(
-            'SELECT ROUND(100*SUM(a.status IN (\'Present\',\'Late\'))/NULLIF(COUNT(*),0),1) as rate
-             FROM Attendance a
-             JOIN Enrollment e ON e.enrollment_id=a.enrollment_id
-             WHERE e.section_id=:sid'
-        );
-        $attStmt->execute([':sid' => $sec['section_id']]);
-        $attRate = $attStmt->fetchColumn();
+        // attendance rate + eligibility distribution (official sessions only)
+        $secSum = ((int)$sec['section_id'] === $selSection && !empty($sectionAtt))
+            ? $sectionAtt
+            : AttendanceService::sectionSummary(get_db(), (int)$sec['section_id']);
+        $attRate  = $secSum['attendance_rate'];
+        $riskCount = (int)$secSum['at_risk'] + (int)($secSum['at_threshold'] ?? 0) + (int)$secSum['ineligible'];
     ?>
     <a href="?section=<?= (int)$sec['section_id'] ?>" class="lec-course-card <?= $isActive ? 'active' : '' ?>"
        style="text-decoration:none;display:block;">
@@ -185,6 +179,9 @@ function initials(string $n): string {
         <div class="lec-course-card__footer">
             <?php if ($wc > 0): ?>
             <span class="lec-course-card__warn">⚠️ <?= $wc ?> SV cảnh báo học vụ</span>
+            <?php endif; ?>
+            <?php if ($riskCount > 0): ?>
+            <span class="lec-course-card__warn" style="color:#b91c1c;">🚫 <?= $riskCount ?> SV nguy cơ/không đủ ĐK</span>
             <?php endif; ?>
             <span class="lec-course-card__action">Chuyển sang lớp này →</span>
         </div>
@@ -263,13 +260,27 @@ function initials(string $n): string {
                 <?php else: ?>
                 <?php foreach ($students as $i => $st):
                     $ini = initials($st['full_name']);
-                    $tot = max(1, (int)$st['total_sessions']);
-                    $att = (int)$st['attended'];
-                    $pct = $tot > 0 ? round($att/$tot*100,1) : 0;
-                    $barCls = $pct >= 90 ? 'ok' : ($pct >= 80 ? 'warn' : 'crit');
-                    $pctCls = $pct >= 90 ? 'ok' : ($pct >= 80 ? 'warn' : 'crit');
-                    $risk = $pct < 80 ? 'Nguy cơ cao' : ($pct < 90 ? 'Theo dõi' : 'An toàn');
-                    $riskLpill = $pct < 80 ? 'lpill--red' : ($pct < 90 ? 'lpill--orange' : 'lpill--green');
+                    $stat = $attByEnrollment[(int)$st['enrollment_id']] ?? null;
+                    $official = (int)($stat['official_total'] ?? 0);
+                    $counted  = (int)($stat['absent_counted'] ?? 0);
+                    $absPct2  = (float)($stat['absent_pct'] ?? 0);
+                    $pct      = $official > 0 ? round(100 - $absPct2, 1) : 0;
+                    $stStatus = $stat['status'] ?? 'no_data';
+                    $stAtThreshold = (int)($stat['risk_level'] ?? 0) === 2;
+                    $barCls   = $stStatus === 'ineligible' ? 'crit'
+                              : ($stAtThreshold ? 'warn' : ($stStatus === 'at_risk' ? 'warn' : ($stStatus === 'eligible' ? 'ok' : 'crit')));
+                    $pctCls   = $barCls;
+                    if ($stStatus === 'ineligible') {
+                        $risk = 'Không đủ ĐK dự thi'; $riskLpill = 'lpill--red';
+                    } elseif ($stAtThreshold) {
+                        $risk = 'Chạm ngưỡng cấm thi'; $riskLpill = 'lpill--red';
+                    } elseif ($stStatus === 'at_risk') {
+                        $risk = 'Nguy cơ mất ĐK'; $riskLpill = 'lpill--orange';
+                    } elseif ($stStatus === 'no_data') {
+                        $risk = 'Chưa có buổi'; $riskLpill = 'lpill--gray';
+                    } else {
+                        $risk = 'Đủ điều kiện'; $riskLpill = 'lpill--green';
+                    }
                     $missing = max(0, (int)($st['assignment_total'] ?? 0) - (int)($st['submitted_total'] ?? 0));
                 ?>
                 <tr>
@@ -291,9 +302,9 @@ function initials(string $n): string {
                             <div class="att-bar">
                                 <div class="att-bar__fill att-bar__fill--<?= $barCls ?>" style="width:<?= $pct ?>%"></div>
                             </div>
-                            <span class="att-pct att-pct--<?= $pctCls ?>"><?= $pct ?>%</span>
+                            <span class="att-pct att-pct--<?= $pctCls ?>"><?= $official > 0 ? $pct.'%' : '—' ?></span>
                         </div>
-                        <div style="font-size:11px;color:#94a3b8;margin-top:2px;"><?= $att ?>/<?= $tot ?> buổi</div>
+                        <div style="font-size:11px;color:#94a3b8;margin-top:2px;">Vắng <?= $counted ?>/<?= $official ?> buổi chính thức</div>
                     </td>
                     <td style="text-align:center;">
                         <?php if ($missing > 0): ?>
@@ -366,13 +377,13 @@ function initials(string $n): string {
             <?= date('d/m/Y H:i', strtotime($w['created_at'])) ?>
         </div>
         <div style="display:flex;gap:6px;margin-top:8px;">
-            <a href="warnings.php" class="lbtn lbtn--red lbtn--sm">Ghi nhận can thiệp</a>
+            <a href="warnings.php?section=<?= (int)$selSection ?>" class="lbtn lbtn--red lbtn--sm">Ghi nhận can thiệp</a>
         </div>
     </div>
     <?php endforeach; ?>
 
     <div style="margin-top:8px;">
-        <a href="warnings.php" class="lbtn lbtn--outline" style="width:100%;justify-content:center;font-size:12px;">
+        <a href="warnings.php?section=<?= (int)$selSection ?>" class="lbtn lbtn--outline" style="width:100%;justify-content:center;font-size:12px;">
             Xem toàn bộ cảnh báo →
         </a>
     </div>
@@ -404,10 +415,15 @@ function openStudentDetail(sid, sectionId){
         .then(function(d){
             if(!d || !d.student_id){document.getElementById('sdBody').innerHTML='<p style="color:#94a3b8;">Không tìm thấy sinh viên trong lớp bạn phụ trách.</p>';return;}
             var a = d.attendance || {};
-            var total = parseInt(a.total,10)||0;
+            var official = parseInt(a.official_total,10)||0;
+            var completed = parseInt(a.completed_total,10)||0;
             var present = parseInt(a.present,10)||0, late = parseInt(a.late,10)||0,
-                absent = parseInt(a.absent,10)||0, excused = parseInt(a.excused,10)||0;
-            var rate = total>0 ? Math.round((present+late+excused)/total*1000)/10 : 0;
+                absent = parseInt(a.absent_counted,10)||0, excuse = parseInt(a.excused,10)||0,
+                rawAbsent = parseInt(a.absent,10)||0;
+            var rate = official>0 ? Math.round((official-absent)/official*1000)/10 : 0;
+            var eligColor = a.status==='ineligible' ? '#b91c1c'
+                          : ((a.at_threshold || a.risk_level===2) ? '#b45309'
+                          : (a.status==='at_risk' ? '#b45309' : '#166534'));
             var html = '<div style="display:flex;align-items:center;gap:12px;padding:12px;background:#f8fafc;border-radius:10px;margin-bottom:14px;">'
                 + '<span class="lec-av" style="width:44px;height:44px;font-size:15px;">'+esc((d.full_name||'').trim().split(/\s+/).map(function(w){return w[0]||'';}).join('').slice(-2).toUpperCase())+'</span>'
                 + '<div><div style="font-weight:800;color:#001634;font-size:15px;">'+esc(d.full_name)+'</div>'
@@ -417,10 +433,11 @@ function openStudentDetail(sid, sectionId){
             html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px;">'
                 + '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:10px;color:#166534;">Có mặt</div><div style="font-size:18px;font-weight:800;color:#166534;">'+present+'</div></div>'
                 + '<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:10px;color:#92400e;">Đi muộn</div><div style="font-size:18px;font-weight:800;color:#92400e;">'+late+'</div></div>'
-                + '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:10px;color:#b91c1c;">Vắng</div><div style="font-size:18px;font-weight:800;color:#b91c1c;">'+absent+'</div></div>'
-                + '<div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:10px;color:#5b21b6;">Có phép</div><div style="font-size:18px;font-weight:800;color:#5b21b6;">'+excused+'</div></div>'
+                + '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:10px;color:#b91c1c;">Vắng (tính)</div><div style="font-size:18px;font-weight:800;color:#b91c1c;">'+absent+'</div></div>'
+                + '<div style="background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:8px;text-align:center;"><div style="font-size:10px;color:#5b21b6;">Có phép</div><div style="font-size:18px;font-weight:800;color:#5b21b6;">'+excuse+'</div></div>'
                 + '</div>';
-            html += '<div style="font-size:12px;color:#64748b;margin-bottom:14px;">Tỷ lệ chuyên cần: <strong style="color:#001634;">'+rate+'%</strong> ('+(present+late+excused)+'/'+total+' buổi) • Trạng thái đăng ký: <strong>'+esc(d.enroll_status)+'</strong>'+(d.enrollment_date?' • Ngày ĐK: '+fmtDate(d.enrollment_date):'')+'</div>';
+            html += '<div style="font-size:12px;color:#64748b;margin-bottom:6px;">Tỷ lệ chuyên cần: <strong style="color:#001634;">'+rate+'%</strong> • Vắng <strong>'+absent+'/'+official+'</strong> buổi chính thức ('+(a.absent_pct||0)+'%) • Đã hoàn thành '+completed+' buổi • Trạng thái ĐK: <strong style="color:'+eligColor+';">'+esc(a.status_label||'—')+'</strong>'+(rawAbsent!==absent?' • gồm '+rawAbsent+' vắng không phép':'')+'</div>';
+            html += '<div style="font-size:11px;color:#94a3b8;margin-bottom:14px;">'+esc(a.explanation||'')+' • Trạng thái đăng ký: <strong>'+esc(d.enroll_status)+'</strong>'+(d.enrollment_date?' • Ngày ĐK: '+fmtDate(d.enrollment_date):'')+'</div>';
 
             html += '<div style="font-size:13px;font-weight:700;color:#001634;margin-bottom:6px;">Bài tập ('+d.submitted_total+'/'+d.assignment_total+' đã nộp)</div>';
             if(!d.assignments || !d.assignments.length){
