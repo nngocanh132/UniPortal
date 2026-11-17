@@ -46,6 +46,10 @@ Render, Koyeb or a VPS.
 * TLS is terminated by Railway's edge; the vhost maps
   `X-Forwarded-Proto: https` to `HTTPS=on`, so session cookies become
   `Secure` automatically.
+* Apache runs mod_php, which only supports the **prefork** MPM. The image
+  removes `mpm_event`/`mpm_worker` at build time and the entrypoint re-checks
+  it before starting Apache, so the service cannot fail with
+  `AH00534: More than one MPM loaded`.
 
 ## 3. Environment variables
 
@@ -149,9 +153,23 @@ This is a data-owner decision and has not been performed.
   row counts match, UTF-8 names preserved, foreign keys enforced.
 * Deny rules: `.env`, `src/`, `storage/`, `database/` and `deploy/` are not
   reachable over HTTP.
-* Docker image build was **not** executed because the local Docker daemon is
-  not running; the Dockerfile/Apache config follow the standard
-  `php:8.2-apache` layout.
+* Docker: the image builds and `apache2ctl -t` passes inside the build. The
+  container starts with only `mpm_prefork_module` loaded (no AH00534) and
+  serves `GET /index.php` with HTTP 200 both on the default port 80 and on an
+  injected `PORT`; the configured security headers are present. The container
+  test used no database, so DB-backed pages were exercised separately against
+  the local MySQL instance.
+
+### Troubleshooting: `AH00534: More than one MPM loaded`
+
+There are no `LoadModule mpm_*` lines in this repository; the conflict comes
+from the Apache image layer. The build step deletes the `mpm_event` and
+`mpm_worker` symlinks from `/etc/apache2/mods-enabled`, enables
+`mpm_prefork`, and runs `apache2ctl -t`. The entrypoint repeats the cleanup
+and runs `apache2ctl -t` before `exec apache2-foreground`, so a bad build
+fails with a clear syntax error instead of a restart loop. After pulling the
+fix, redeploy without the build cache (Railway → Deploy → *Clear build
+cache*) if the old image is reused.
 
 ## 7. Acceptance checklist (run on the public URL)
 

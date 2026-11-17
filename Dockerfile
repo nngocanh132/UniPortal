@@ -1,8 +1,12 @@
 FROM php:8.2-apache
 
 # PHP extensions required by the application.
+# mod_php only works with the prefork MPM, so any other MPM symlink is removed
+# here; loading two MPMs aborts Apache with "AH00534: More than one MPM loaded".
 RUN docker-php-ext-install pdo_mysql \
-    && a2enmod rewrite headers expires
+    && rm -f /etc/apache2/mods-enabled/mpm_event.* \
+             /etc/apache2/mods-enabled/mpm_worker.* \
+    && a2enmod mpm_prefork rewrite headers expires
 
 # Production PHP configuration.
 COPY docker/php.ini /usr/local/etc/php/conf.d/uniportal.ini
@@ -25,6 +29,9 @@ RUN mkdir -p /var/www/html/storage/uploads/assignments \
              /var/www/html/storage/sessions \
     && chown -R www-data:www-data /var/www/html/storage \
     && chmod -R u+rwX,g+rwX /var/www/html/storage
+
+# Fail the image build on a broken Apache config.
+RUN apache2ctl -t
 
 ENV APACHE_DOCUMENT_ROOT=/var/www/html/public
 ENV APP_ENV=production
